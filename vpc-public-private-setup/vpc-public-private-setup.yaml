@@ -37,7 +37,17 @@ Parameters:
       - ACCEPT
       - REJECT
       - ALL
+  EnableFlowLogs:
+    Description: Enable VPC Flow Logs
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
 
+
+Conditions:
+  EnableFlowLogsCondition: !Equals [!Ref EnableFlowLogs, 'true']
 
 Resources:
   PubPrivateVPC:
@@ -261,6 +271,7 @@ Resources:
 
   LogGroup:
     Type: 'AWS::Logs::LogGroup'
+    Condition: EnableFlowLogsCondition
     Properties:
       LogGroupName: !Sub /vpcflowlogs/${ResourcesPrefixName}
       RetentionInDays:
@@ -268,6 +279,7 @@ Resources:
 
   Role:
     Type: 'AWS::IAM::Role'
+    Condition: EnableFlowLogsCondition
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -295,6 +307,7 @@ Resources:
 
   FlowLog:
     Type: 'AWS::EC2::FlowLog'
+    Condition: EnableFlowLogsCondition
     Properties:
       DeliverLogsPermissionArn:
         'Fn::GetAtt':
@@ -367,6 +380,7 @@ Outputs:
         'Fn::Sub': '${AWS::StackName}-publicSubnetID3'
 
   LogGroupARN:
+    Condition: EnableFlowLogsCondition
     Description: >-
       The name of the CloudWatch Logs log group where the
       flow logs will be published.
