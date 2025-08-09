@@ -44,10 +44,18 @@ Parameters:
     AllowedValues:
       - 'true'
       - 'false'
+  EnablePrivateSubnets:
+    Description: Enable private subnets and associated resources
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
 
 
 Conditions:
   EnableFlowLogsCondition: !Equals [!Ref EnableFlowLogs, 'true']
+  EnablePrivateSubnetsCondition: !Equals [!Ref EnablePrivateSubnets, 'true']
 
 Resources:
   PubPrivateVPC:
@@ -107,6 +115,7 @@ Resources:
 
   PrivateSubnet1:
     Type: 'AWS::EC2::Subnet'
+    Condition: EnablePrivateSubnetsCondition
     Properties:
       VpcId:
         Ref: PubPrivateVPC
@@ -122,6 +131,7 @@ Resources:
 
   PrivateSubnet2:
     Type: 'AWS::EC2::Subnet'
+    Condition: EnablePrivateSubnetsCondition
     Properties:
       VpcId:
         Ref: PubPrivateVPC
@@ -137,6 +147,7 @@ Resources:
 
   PrivateSubnet3:
     Type: 'AWS::EC2::Subnet'
+    Condition: EnablePrivateSubnetsCondition
     Properties:
       VpcId:
         Ref: PubPrivateVPC
@@ -210,6 +221,7 @@ Resources:
 
   NatGateway:
     Type: 'AWS::EC2::NatGateway'
+    Condition: EnablePrivateSubnetsCondition
     Properties:
       AllocationId:
         'Fn::GetAtt':
@@ -223,12 +235,14 @@ Resources:
 
   NatPublicIP:
     Type: 'AWS::EC2::EIP'
+    Condition: EnablePrivateSubnetsCondition
     DependsOn: PubPrivateVPC
     Properties:
       Domain: vpc
 
   PrivateRouteTable:
     Type: 'AWS::EC2::RouteTable'
+    Condition: EnablePrivateSubnetsCondition
     Properties:
       VpcId:
         Ref: PubPrivateVPC
@@ -238,6 +252,7 @@ Resources:
 
   PrivateRoute:
     Type: 'AWS::EC2::Route'
+    Condition: EnablePrivateSubnetsCondition
     Properties:
       RouteTableId:
         Ref: PrivateRouteTable
@@ -247,6 +262,7 @@ Resources:
 
   PrivateSubnet1RouteTableAssociation:
     Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: EnablePrivateSubnetsCondition
     Properties:
       SubnetId:
         Ref: PrivateSubnet1
@@ -255,6 +271,7 @@ Resources:
 
   PrivateSubnet2RouteTableAssociation:
     Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: EnablePrivateSubnetsCondition
     Properties:
       SubnetId:
         Ref: PrivateSubnet2
@@ -263,6 +280,7 @@ Resources:
 
   PrivateSubnet3RouteTableAssociation:
     Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: EnablePrivateSubnetsCondition
     Properties:
       SubnetId:
         Ref: PrivateSubnet3
@@ -332,6 +350,7 @@ Outputs:
         'Fn::Sub': '${AWS::StackName}-VPCId'
 
   PrivateSubnet1ID:
+    Condition: EnablePrivateSubnetsCondition
     Description: Private Subnet A ID
     Value:
       Ref: PrivateSubnet1
@@ -340,6 +359,7 @@ Outputs:
         'Fn::Sub': '${AWS::StackName}-privateSubnetID1'
 
   PrivateSubnet2ID:
+    Condition: EnablePrivateSubnetsCondition
     Description: Private Subnet B ID
     Value:
       Ref: PrivateSubnet2
@@ -348,6 +368,7 @@ Outputs:
         'Fn::Sub': '${AWS::StackName}-privateSubnetID2'
 
   PrivateSubnet3ID:
+    Condition: EnablePrivateSubnetsCondition
     Description: Private Subnet B ID
     Value:
       Ref: PrivateSubnet3
