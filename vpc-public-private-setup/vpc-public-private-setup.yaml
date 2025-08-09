@@ -43,7 +43,7 @@ Resources:
   PubPrivateVPC:
     Type: 'AWS::EC2::VPC'
     Properties:
-      CidrBlock: 10.53.4.0/22
+      CidrBlock: 10.0.0.0/8
       EnableDnsHostnames: true
       EnableDnsSupport: true
       Tags:
@@ -59,7 +59,7 @@ Resources:
         'Fn::Select':
           - 0
           - 'Fn::GetAZs': ''
-      CidrBlock: 10.53.7.0/26
+      CidrBlock: 10.10.1.0/24
       MapPublicIpOnLaunch: true
       Tags:
         - Key: Name
@@ -74,7 +74,7 @@ Resources:
           - 'Fn::GetAZs': ''
       VpcId:
         Ref: PubPrivateVPC
-      CidrBlock: 10.53.7.64/26
+      CidrBlock: 10.10.2.0/24
       MapPublicIpOnLaunch: true
       Tags:
         - Key: Name
@@ -89,7 +89,7 @@ Resources:
           - 'Fn::GetAZs': ''
       VpcId:
         Ref: PubPrivateVPC
-      CidrBlock: 10.53.7.128/26
+      CidrBlock: 10.10.3.0/24
       MapPublicIpOnLaunch: true
       Tags:
         - Key: Name
@@ -104,7 +104,7 @@ Resources:
         'Fn::Select':
           - 0
           - 'Fn::GetAZs': ''
-      CidrBlock: 10.53.4.0/24
+      CidrBlock: 10.10.4.0/24
       MapPublicIpOnLaunch: false
       Tags:
         - Key: Name
@@ -119,7 +119,7 @@ Resources:
         'Fn::Select':
           - 1
           - 'Fn::GetAZs': ''
-      CidrBlock: 10.53.5.0/24
+      CidrBlock: 10.10.5.0/24
       MapPublicIpOnLaunch: false
       Tags:
         - Key: Name
@@ -134,7 +134,7 @@ Resources:
         'Fn::Select':
           - 2
           - 'Fn::GetAZs': ''
-      CidrBlock: 10.53.6.0/24
+      CidrBlock: 10.10.6.0/24
       MapPublicIpOnLaunch: false
       Tags:
         - Key: Name
