@@ -1,8 +1,13 @@
 AWSTemplateFormatVersion: 2010-09-09
+# Fn::ForEach (used to fan a fleet of bastions out of one loop) requires the
+# AWS::LanguageExtensions transform.
+Transform: AWS::LanguageExtensions
 Description: >
-  EC2 Spot bastion host / worker instance. The Auto Scaling group
-  is created for health/recovery purposes and for allocating the
-  Spot instance in the cheaper Availability Zone.
+  EC2 Spot bastion host fleet. One bastion is created per name in BastionNames
+  - each with its own launch template, Auto Scaling group, and (when enabled)
+  its own Elastic IP and persistent EBS data volume - all in a single stack.
+  Each Auto Scaling group is size 1, created for health/recovery and for
+  allocating the Spot instance in the cheaper Availability Zone.
 
 ##
 # Metadata and organisation
@@ -14,11 +19,11 @@ Metadata:
         Label:
           default: "Server settings ..."
         Parameters:
+          - BastionNames
           - OSFamily
           - RhelAmiId
           - InstanceType
           - Keypair
-          - TheHostname
       -
         Label:
           default: "Networking ..."
@@ -39,6 +44,17 @@ Metadata:
 # Template parameter's
 #
 Parameters:
+
+  BastionNames:
+    Description: >
+      Comma-separated list of bastion host names; ONE bastion (with its own
+      launch template, Auto Scaling group, and - when enabled - its own
+      Elastic IP and persistent data volume) is created per name, all in this
+      single stack. Names MUST be alphanumeric (they are used verbatim in
+      resource logical IDs), e.g. "bastion1,bastion2". Each name is also the
+      instance hostname and the prefix for that host's EIP/volume Name tags.
+    Type: CommaDelimitedList
+    Default: bastion1
 
   Subnet:
     Description: The EC2 Instance will be launched in this subnet.
@@ -91,28 +107,23 @@ Parameters:
 
   AssignEIP:
     Description: >
-      'yes' allocates an Elastic IP and the instance associates it to itself
-      at boot, giving the bastion a stable public IP that survives Spot
-      replacements. 'no' skips the EIP (and its IAM permissions); the instance
-      then relies on the subnet's auto-assigned public IP, if any, or on SSM
-      Session Manager for access.
+      'yes' allocates an Elastic IP PER bastion and each instance associates
+      its own EIP at boot, giving every bastion a stable public IP that
+      survives Spot replacements. 'no' skips the EIPs (and their IAM
+      permissions); instances then rely on the subnet's auto-assigned public
+      IP, if any, or on SSM Session Manager for access.
     Type: String
     Default: 'yes'
     AllowedValues:
       - 'yes'
       - 'no'
 
-  TheHostname:
-    Description: The hostname for the bastion server.
-    Type: String
-    Default: 'the-bastion-host'
-
   PersistentStorage:
     Description: >
-      'yes' provisions a retained, encrypted EBS data volume and PINS the
-      instance to a single Availability Zone (chosen automatically) so the
-      volume can re-attach across Spot replacements. 'no' uses ephemeral
-      root-only storage and lets Spot place the instance in any AZ (cheapest).
+      'yes' provisions a retained, encrypted EBS data volume PER bastion and
+      PINS every instance to a single Availability Zone (chosen automatically)
+      so the volumes can re-attach across Spot replacements. 'no' uses ephemeral
+      root-only storage and lets Spot place instances in any AZ (cheapest).
     Type: String
     Default: 'no'
     AllowedValues:
@@ -120,14 +131,14 @@ Parameters:
       - 'no'
 
   DataVolumeSize:
-    Description: Size (GiB) of the persistent data volume. Only used when PersistentStorage=yes.
+    Description: Size (GiB) of each persistent data volume. Only used when PersistentStorage=yes.
     Type: Number
     Default: 20
     MinValue: 1
     MaxValue: 200
 
   DataMountPoint:
-    Description: Filesystem path where the persistent data volume is mounted. Only used when PersistentStorage=yes.
+    Description: Filesystem path where each persistent data volume is mounted. Only used when PersistentStorage=yes.
     Type: String
     Default: /data
 
@@ -162,11 +173,12 @@ Conditions:
   # AMI id from RhelAmiId rather than a {{resolve:ssm:...}} lookup.
   IsRhel: !Equals [!Ref OSFamily, 'RHEL']
 
-  # True when a persistent EBS data volume should be created and the ASG
-  # pinned to that volume's AZ.
+  # True when a persistent EBS data volume should be created per bastion and
+  # the ASGs pinned to that volume's AZ.
   UsePersistentStorage: !Equals [!Ref PersistentStorage, 'yes']
 
-  # True when an Elastic IP should be allocated and self-associated at boot.
+  # True when an Elastic IP should be allocated per bastion and self-associated
+  # at boot.
   UseEIP: !Equals [!Ref AssignEIP, 'yes']
 
   # True when the instance role needs any inline policy at all (i.e. the EIP
@@ -177,368 +189,7 @@ Conditions:
 Resources:
 
   ###
-  # ASG Bastion fleet
-  ##
-  ASGSpotFlet:
-    Type: AWS::AutoScaling::AutoScalingGroup
-    CreationPolicy:
-      AutoScalingCreationPolicy:
-        MinSuccessfulInstancesPercent: 100
-      ResourceSignal:
-        Count: 1
-        Timeout: PT10M
-    UpdatePolicy:
-      AutoScalingRollingUpdate:
-        MaxBatchSize: 1
-        MinInstancesInService: 0
-        MinSuccessfulInstancesPercent: 100
-        PauseTime: PT10M
-        WaitOnResourceSignals: true
-    Metadata:
-      Comment: "Spot Bastion host"
-      AWS::CloudFormation::Init:
-        # The UserData shim detects the OS family and invokes cfn-init with
-        # '-c apt' or '-c rpm'. cfn-init runs ONLY the configs in the chosen
-        # set, so package names are resolved per family declaratively instead
-        # of in shell. The 'default' set (files only) is what the cfn-hup
-        # auto-reloader re-applies on stack updates.
-        configSets:
-          default:
-            - common
-          apt:
-            - common
-            - apt_packages
-          rpm:
-            - common
-            - rpm_packages
-        common:
-            files:
-                "/etc/cfn/cfn-hup.conf":
-                  content: !Sub |
-                    [main]
-                    stack=${AWS::StackId}
-                    region=${AWS::Region}
-                    interval=3
-                  mode: "000400"
-                  owner: "root"
-                  group: "root"
-
-                "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
-                  content: !Sub |
-                    [cfn-auto-reloader-hook]
-                    triggers=post.update
-                    path=Resources.ASGSpotFletLT.Metadata.AWS::CloudFormation::Init
-                    action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource ASGSpotFlet --region ${AWS::Region}
-                  mode: "000400"
-                  owner: "root"
-                  group: "root"
-        apt_packages:
-            packages:
-                apt:
-                    htop: []
-                    unzip: []
-                    git: []
-                    gcc: []
-                    curl: []
-                    telnet: []
-                    nmap: []
-                    nvme-cli: []
-                    docker.io: []
-                    docker-compose: []
-        rpm_packages:
-            packages:
-                yum:
-                    htop: []
-                    unzip: []
-                    git: []
-                    gcc: []
-                    curl: []
-                    telnet: []
-                    nmap: []
-                    nvme-cli: []
-                    docker: []
-    Properties:
-      MixedInstancesPolicy:
-        InstancesDistribution:
-          # Configuring here for 'Full Spot Fleet'
-          OnDemandAllocationStrategy: prioritized
-          OnDemandBaseCapacity: 0
-          OnDemandPercentageAboveBaseCapacity: 0
-          SpotAllocationStrategy: lowest-price
-          # SpotInstancePools: Integer
-          # SpotMaxPrice: String
-        LaunchTemplate:
-          LaunchTemplateSpecification:
-            LaunchTemplateId: !Ref ASGSpotFletLT
-            Version: !GetAtt ASGSpotFletLT.LatestVersionNumber
-      MinSize: '1'
-      MaxSize: '1'
-      DesiredCapacity: '1'
-      VPCZoneIdentifier: !Ref Subnet
-      # AZ placement:
-      #  - Ephemeral (default): no AZ constraint, so Spot places the instance
-      #    in whichever of your subnets' AZs is cheapest.
-      #  - Persistent: constrain the ASG to the SAME AZ the DataVolume lives in
-      #    (!Select [0, !GetAZs ''] - the region's first AZ). The ASG launches
-      #    only in the supplied subnet that is in that AZ; if none exists it
-      #    fails loudly rather than orphaning the volume. This is the same
-      #    expression the DataVolume uses, so the two can never diverge.
-      AvailabilityZones: !If
-        - UsePersistentStorage
-        - - !Select [0, !GetAZs '']
-        - !Ref 'AWS::NoValue'
-      Tags:
-        -
-          Key: "Name"
-          Value: !Ref TheHostname
-          PropagateAtLaunch: true
-
-  ###
-  # ASG Spot fleet Launch Template
-  ##
-  ASGSpotFletLT:
-    Type: AWS::EC2::LaunchTemplate
-    Metadata:
-      # W1030 false positive: linter checks RhelAmiId's empty default against
-      # the AMI-id pattern without following the !If [IsRhel, ...] guard. The
-      # empty value only reaches ImageId when OSFamily=RHEL, in which case a
-      # valid id is required (and enforced by the parameter's AllowedPattern).
-      cfn-lint:
-        config:
-          ignore_checks:
-            - W1030
-    Properties:
-      LaunchTemplateData:
-        # AMI: RHEL uses the raw id (no public SSM param); the others resolve
-        # the latest region-appropriate AMI from the SSM path in OSMap.
-        ImageId: !If
-          - IsRhel
-          - !Ref RhelAmiId
-          - !Sub
-            - '{{resolve:ssm:${Path}}}'
-            - Path: !FindInMap [OSMap, !Ref OSFamily, SsmPath]
-        InstanceType: !Ref InstanceType
-        KeyName: !If [HasKeypair, !Ref Keypair, !Ref 'AWS::NoValue']
-        SecurityGroupIds: [ !Ref ASGSpotFletSG ]
-        IamInstanceProfile:
-          Name: !Ref BastionInstanceProfile
-        BlockDeviceMappings:
-          # Root device name is derived from OSFamily, so it always matches
-          # the AMI (otherwise the size override would be silently ignored).
-          - DeviceName: !FindInMap [OSMap, !Ref OSFamily, RootDevice]
-            Ebs:
-              VolumeSize: 25
-        UserData:
-          Fn::Base64:
-            !Sub |
-              #!/bin/bash -xe
-
-              ###
-              # OS-agnostic package-manager abstraction.
-              # Supports apt (Debian/Ubuntu) and dnf/yum (Amazon Linux, RHEL,
-              # CentOS, Rocky). Everything below is expressed through these
-              # helpers so the same UserData boots on any of those families.
-              ##
-              # PKG drives the shell helpers; CFN_CONFIGSET selects which
-              # cfn-init packages block runs (apt block vs yum/rpm block).
-              if command -v dnf >/dev/null 2>&1; then
-                PKG=dnf; CFN_CONFIGSET=rpm
-              elif command -v yum >/dev/null 2>&1; then
-                PKG=yum; CFN_CONFIGSET=rpm
-              elif command -v apt-get >/dev/null 2>&1; then
-                PKG=apt; CFN_CONFIGSET=apt
-              else
-                echo "No supported package manager (dnf/yum/apt) found" >&2
-                exit 1
-              fi
-
-              pkg_update() {
-                case "$PKG" in
-                  apt) apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -y \
-                         -o Dpkg::Options::="--force-confdef" \
-                         -o Dpkg::Options::="--force-confold" upgrade ;;
-                  dnf) dnf -y upgrade ;;
-                  yum) yum -y update ;;
-                esac
-              }
-
-              pkg_install() {
-                case "$PKG" in
-                  apt) DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
-                  dnf) dnf install -y "$@" ;;
-                  yum) yum install -y "$@" ;;
-                esac
-              }
-
-              # Update && upgrade
-              pkg_update
-
-              ## CFN Initialization ##
-
-              # aws CLI is preinstalled on Amazon Linux; install it elsewhere.
-              command -v aws >/dev/null 2>&1 || pkg_install awscli
-
-              # Locate cfn-bootstrap (preinstalled at /opt/aws/bin on Amazon
-              # Linux) or install the Python 3 build (Debian/Ubuntu/RHEL).
-              if [ -x /opt/aws/bin/cfn-init ]; then
-                CFN_BIN=/opt/aws/bin
-              elif [ -x /usr/local/bin/cfn-init ]; then
-                CFN_BIN=/usr/local/bin
-              else
-                pkg_install python3-pip
-                pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
-                CFN_BIN=/usr/local/bin
-              fi
-
-              # Normalize the cfn binaries under /opt/aws/bin so the static
-              # cfn-hup reloader hook path is valid regardless of OS family.
-              if [ "$CFN_BIN" != "/opt/aws/bin" ]; then
-                mkdir -p /opt/aws/bin
-                for b in cfn-init cfn-hup cfn-signal cfn-get-metadata; do
-                  [ -x "/opt/aws/bin/$b" ] || ln -sf "$CFN_BIN/$b" "/opt/aws/bin/$b"
-                done
-              fi
-
-              # From here on, signal failure to CloudFormation on any error so
-              # the stack fails fast instead of waiting for the timeout.
-              trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackId} --resource ASGSpotFlet --region ${AWS::Region}' ERR
-
-              # Run cfn-init with the OS-specific config set. cfn-init installs
-              # the files (common) and the packages block for this family
-              # (apt_packages or rpm_packages) declaratively from the Metadata.
-              /opt/aws/bin/cfn-init -v -c $CFN_CONFIGSET \
-                -s ${AWS::StackId} -r ASGSpotFlet --region ${AWS::Region}
-
-              # Start cfn-hup daemon so it keeps listening for Metadata changes.
-              /opt/aws/bin/cfn-hup
-
-              ## Extras that cfn-init's declarative 'packages' can't express ##
-              # Kernel headers must be pinned to the running kernel via uname,
-              # which is a runtime value with no static package name.
-              case "$PKG" in
-                apt)
-                  pkg_install "linux-headers-$(uname -r)"
-                  ;;
-                dnf|yum)
-                  pkg_install "kernel-devel-$(uname -r)"
-                  # Compose is a dnf plugin on RHEL-family repos, not a package.
-                  pkg_install docker-compose-plugin || true
-                  ;;
-              esac
-
-              # Enable the docker daemon if it was installed.
-              systemctl enable --now docker 2>/dev/null || true
-
-              # Ensure the SSM agent is present and running so Session Manager
-              # works (primary access path when no key pair is supplied).
-              # Preinstalled on Amazon Linux; install elsewhere. Service name is
-              # 'amazon-ssm-agent' (rpm) or 'snap.amazon-ssm-agent.amazon-ssm-agent'
-              # on Ubuntu (snap), so enable whichever unit exists.
-              if ! systemctl list-unit-files 2>/dev/null | grep -q ssm-agent; then
-                case "$PKG" in
-                  apt) snap install amazon-ssm-agent --classic 2>/dev/null || \
-                       pkg_install amazon-ssm-agent || true ;;
-                  dnf|yum) pkg_install amazon-ssm-agent || true ;;
-                esac
-              fi
-              systemctl enable --now amazon-ssm-agent 2>/dev/null || \
-                systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent 2>/dev/null || true
-
-              # IMDSv2 token (used for both the data volume and the EIP below).
-              TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
-                        -H "X-aws-ec2-metadata-token-ttl-seconds: 300" || true)
-              imds() { curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
-                        "http://169.254.169.254/latest/meta-data/$1"; }
-              INSTANCE_ID=$(imds instance-id)
-
-              ## Persistent data volume (attach the CloudFormation-managed EBS) ##
-              # Only when PersistentStorage=yes. The volume is created and owned
-              # by CloudFormation (the DataVolume resource) in the same AZ the
-              # ASG is pinned to; here we just find it by its Name tag, attach,
-              # and mount. Data survives because we format ONLY when it's blank.
-              if [ "${PersistentStorage}" = "yes" ]; then
-                AZ=$(imds placement/availability-zone)
-                VOL_NAME="${TheHostname}-data"
-                MP="${DataMountPoint}"
-
-                # ASG and DataVolume are created concurrently (no static
-                # DependsOn is possible on a conditional resource), so poll
-                # until CloudFormation has created the volume.
-                VOL_ID=""
-                for i in $(seq 1 30); do
-                  VOL_ID=$(aws --region ${AWS::Region} ec2 describe-volumes \
-                    --filters "Name=tag:Name,Values=$VOL_NAME" \
-                              "Name=availability-zone,Values=$AZ" \
-                    --query 'Volumes[0].VolumeId' --output text)
-                  [ "$VOL_ID" != "None" ] && [ -n "$VOL_ID" ] && break
-                  sleep 10
-                done
-
-                aws --region ${AWS::Region} ec2 wait volume-available --volume-ids "$VOL_ID"
-                aws --region ${AWS::Region} ec2 attach-volume \
-                  --volume-id "$VOL_ID" --instance-id "$INSTANCE_ID" --device /dev/sdf
-
-                # Resolve the device: Nitro renames /dev/sdf to a /dev/nvmeXn1
-                # whose serial encodes the volume id (vol-xxxx, no dash).
-                VOL_SERIAL=$(echo "$VOL_ID" | tr -d '-')
-                DEV=""
-                for i in $(seq 1 30); do
-                  if [ -e /dev/sdf ]; then DEV=/dev/sdf; break; fi
-                  for d in /dev/nvme*n1; do
-                    [ -e "$d" ] || continue
-                    if nvme id-ctrl -v "$d" 2>/dev/null | grep -q "$VOL_SERIAL"; then
-                      DEV="$d"; break
-                    fi
-                  done
-                  [ -n "$DEV" ] && break
-                  sleep 2
-                done
-
-                # Format only if there is no filesystem yet (preserves data).
-                if ! blkid "$DEV" >/dev/null 2>&1; then
-                  mkfs.ext4 -L bastion-data "$DEV"
-                fi
-
-                # Mount by UUID via fstab (nofail so a bad volume never blocks boot).
-                mkdir -p "$MP"
-                UUID=$(blkid -s UUID -o value "$DEV")
-                if ! grep -q "$UUID" /etc/fstab; then
-                  echo "UUID=$UUID $MP ext4 defaults,nofail 0 2" >> /etc/fstab
-                fi
-                mount -a
-              fi
-
-              # Change hostname (systemd first, fall back to legacy).
-              hostnamectl set-hostname ${TheHostname} 2>/dev/null || {
-                hostname ${TheHostname}
-                echo ${TheHostname} > /etc/hostname
-              }
-
-              ## Associate the Elastic IP (only when AssignEIP=yes) ##
-              # The EIP is a CloudFormation-managed resource tagged for this
-              # host; look up its allocation id by tag and associate it to
-              # this instance so a stable public IP survives Spot replacements.
-              if [ "${AssignEIP}" = "yes" ]; then
-                sleep 15
-                ALLOC_ID=$(aws --region ${AWS::Region} ec2 describe-addresses \
-                  --filters "Name=tag:Name,Values=${TheHostname}-eip" \
-                  --query 'Addresses[0].AllocationId' --output text)
-                aws --region ${AWS::Region} ec2 associate-address \
-                          --instance-id "$INSTANCE_ID" \
-                          --allocation-id "$ALLOC_ID"
-              fi
-
-              # Set SSH keepalive (~4h idle: 60m interval x 4).
-              sed -i "/ClientAliveInterval/c\ClientAliveInterval 60m" /etc/ssh/sshd_config
-              sed -i "/ClientAliveCountMax/c\ClientAliveCountMax 4" /etc/ssh/sshd_config
-              # sshd service is 'ssh' on Debian/Ubuntu, 'sshd' on RHEL-family.
-              systemctl restart sshd 2>/dev/null || systemctl restart ssh
-
-              # As a last step, signal success to the stack.
-              /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackId} --resource ASGSpotFlet --region ${AWS::Region}
-
-  ###
-  # ASG Spot fleet SG
+  # Shared security group (all bastions)
   ##
   ASGSpotFletSG:
     Type: AWS::EC2::SecurityGroup
@@ -552,41 +203,7 @@ Resources:
           CidrIp: !Ref SourceIP
 
   ###
-  # EIP
-  ##
-  BastionEIP:
-    Type: AWS::EC2::EIP
-    Condition: UseEIP
-    Properties:
-      Domain: vpc
-      Tags:
-        - Key: Name
-          Value: !Sub '${TheHostname}-eip'
-
-  ###
-  # Persistent data volume (only when PersistentStorage=yes)
-  ##
-  # A first-class, CloudFormation-managed EBS volume. Its AvailabilityZone is
-  # the same !Select [0, !GetAZs ''] the ASG is constrained to, so the volume
-  # and the instance always co-locate. Retained on stack delete so data is not
-  # lost; the attach happens at boot in UserData (an ASG has no static instance
-  # id for AWS::EC2::VolumeAttachment to reference).
-  DataVolume:
-    Type: AWS::EC2::Volume
-    Condition: UsePersistentStorage
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      AvailabilityZone: !Select [0, !GetAZs '']
-      Size: !Ref DataVolumeSize
-      VolumeType: gp3
-      Encrypted: true
-      Tags:
-        - Key: Name
-          Value: !Sub '${TheHostname}-data'
-
-  ###
-  # IAM / Security configuration
+  # Shared IAM / instance profile (all bastions)
   ##
   BastionInstanceRole:
     Type: AWS::IAM::Role
@@ -607,6 +224,8 @@ Resources:
       - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
       # Inline policy is only present when the EIP and/or data volume are in
       # use; otherwise the role carries just the SSM managed policy above.
+      # Resource '*' is required because the EIPs/volumes are discovered and
+      # associated at boot by tag (their ids are not known at template time).
       Policies: !If
         - HasInlinePolicy
         - - PolicyName: BastionInstanceRole
@@ -650,17 +269,428 @@ Resources:
       Roles:
       - !Ref BastionInstanceRole
 
+  ###
+  # Per-bastion fleet: one ASG + launch template (+ optional EIP and data
+  # volume) generated for each name in BastionNames. The loop identifier is
+  # TheHostname, so every '${TheHostname}' below - in logical IDs, tags, and
+  # UserData - is replaced by Fn::ForEach with the bastion's name before the
+  # rest of the intrinsics (!Sub, !Ref, ...) are evaluated.
+  ##
+  Fn::ForEach::Bastions:
+    - TheHostname
+    - !Ref BastionNames
+
+    - 'ASGSpotFlet${TheHostname}':
+        Type: AWS::AutoScaling::AutoScalingGroup
+        CreationPolicy:
+          AutoScalingCreationPolicy:
+            MinSuccessfulInstancesPercent: 100
+          ResourceSignal:
+            Count: 1
+            Timeout: PT10M
+        UpdatePolicy:
+          AutoScalingRollingUpdate:
+            MaxBatchSize: 1
+            MinInstancesInService: 0
+            MinSuccessfulInstancesPercent: 100
+            PauseTime: PT10M
+            WaitOnResourceSignals: true
+        Metadata:
+          Comment: "Spot Bastion host"
+          AWS::CloudFormation::Init:
+            # The UserData shim detects the OS family and invokes cfn-init with
+            # '-c apt' or '-c rpm'. cfn-init runs ONLY the configs in the chosen
+            # set, so package names are resolved per family declaratively instead
+            # of in shell. The 'default' set (files only) is what the cfn-hup
+            # auto-reloader re-applies on stack updates.
+            configSets:
+              default:
+                - common
+              apt:
+                - common
+                - apt_packages
+              rpm:
+                - common
+                - rpm_packages
+            common:
+                files:
+                    "/etc/cfn/cfn-hup.conf":
+                      content: !Sub |
+                        [main]
+                        stack=${AWS::StackId}
+                        region=${AWS::Region}
+                        interval=3
+                      mode: "000400"
+                      owner: "root"
+                      group: "root"
+
+                    "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+                      content: !Sub |
+                        [cfn-auto-reloader-hook]
+                        triggers=post.update
+                        path=Resources.ASGSpotFletLT${TheHostname}.Metadata.AWS::CloudFormation::Init
+                        action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource ASGSpotFlet${TheHostname} --region ${AWS::Region}
+                      mode: "000400"
+                      owner: "root"
+                      group: "root"
+            apt_packages:
+                packages:
+                    apt:
+                        htop: []
+                        unzip: []
+                        git: []
+                        gcc: []
+                        curl: []
+                        telnet: []
+                        nmap: []
+                        nvme-cli: []
+                        docker.io: []
+                        docker-compose: []
+            rpm_packages:
+                packages:
+                    yum:
+                        htop: []
+                        unzip: []
+                        git: []
+                        gcc: []
+                        curl: []
+                        telnet: []
+                        nmap: []
+                        nvme-cli: []
+                        docker: []
+        Properties:
+          MixedInstancesPolicy:
+            InstancesDistribution:
+              # Configuring here for 'Full Spot Fleet'
+              OnDemandAllocationStrategy: prioritized
+              OnDemandBaseCapacity: 0
+              OnDemandPercentageAboveBaseCapacity: 0
+              SpotAllocationStrategy: lowest-price
+              # SpotInstancePools: Integer
+              # SpotMaxPrice: String
+            LaunchTemplate:
+              LaunchTemplateSpecification:
+                # Cross-references to a looped logical ID must wrap the loop
+                # identifier in Fn::Sub (per AWS::LanguageExtensions docs).
+                LaunchTemplateId: !Ref
+                  'Fn::Sub': 'ASGSpotFletLT${TheHostname}'
+                Version: !GetAtt
+                  - !Sub 'ASGSpotFletLT${TheHostname}'
+                  - LatestVersionNumber
+          MinSize: '1'
+          MaxSize: '1'
+          DesiredCapacity: '1'
+          VPCZoneIdentifier: !Ref Subnet
+          # AZ placement:
+          #  - Ephemeral (default): no AZ constraint, so Spot places each
+          #    instance in whichever of your subnets' AZs is cheapest.
+          #  - Persistent: constrain every ASG to the SAME AZ its DataVolume
+          #    lives in (!Select [0, !GetAZs ''] - the region's first AZ). The
+          #    ASG launches only in the supplied subnet that is in that AZ; if
+          #    none exists it fails loudly rather than orphaning the volume.
+          #    NOTE: with persistent storage on, all bastions share that one AZ.
+          AvailabilityZones: !If
+            - UsePersistentStorage
+            - - !Select [0, !GetAZs '']
+            - !Ref 'AWS::NoValue'
+          Tags:
+            -
+              Key: "Name"
+              Value: !Sub '${TheHostname}'
+              PropagateAtLaunch: true
+
+      'ASGSpotFletLT${TheHostname}':
+        Type: AWS::EC2::LaunchTemplate
+        Metadata:
+          # W1030 false positive: linter checks RhelAmiId's empty default against
+          # the AMI-id pattern without following the !If [IsRhel, ...] guard. The
+          # empty value only reaches ImageId when OSFamily=RHEL, in which case a
+          # valid id is required (and enforced by the parameter's AllowedPattern).
+          cfn-lint:
+            config:
+              ignore_checks:
+                - W1030
+        Properties:
+          LaunchTemplateData:
+            # AMI: RHEL uses the raw id (no public SSM param); the others resolve
+            # the latest region-appropriate AMI from the SSM path in OSMap.
+            ImageId: !If
+              - IsRhel
+              - !Ref RhelAmiId
+              - !Sub
+                - '{{resolve:ssm:${Path}}}'
+                - Path: !FindInMap [OSMap, !Ref OSFamily, SsmPath]
+            InstanceType: !Ref InstanceType
+            KeyName: !If [HasKeypair, !Ref Keypair, !Ref 'AWS::NoValue']
+            SecurityGroupIds: [ !Ref ASGSpotFletSG ]
+            IamInstanceProfile:
+              Name: !Ref BastionInstanceProfile
+            BlockDeviceMappings:
+              # Root device name is derived from OSFamily, so it always matches
+              # the AMI (otherwise the size override would be silently ignored).
+              - DeviceName: !FindInMap [OSMap, !Ref OSFamily, RootDevice]
+                Ebs:
+                  VolumeSize: 25
+            UserData:
+              Fn::Base64:
+                !Sub |
+                  #!/bin/bash -xe
+
+                  ###
+                  # OS-agnostic package-manager abstraction.
+                  # Supports apt (Debian/Ubuntu) and dnf/yum (Amazon Linux, RHEL,
+                  # CentOS, Rocky). Everything below is expressed through these
+                  # helpers so the same UserData boots on any of those families.
+                  ##
+                  # PKG drives the shell helpers; CFN_CONFIGSET selects which
+                  # cfn-init packages block runs (apt block vs yum/rpm block).
+                  if command -v dnf >/dev/null 2>&1; then
+                    PKG=dnf; CFN_CONFIGSET=rpm
+                  elif command -v yum >/dev/null 2>&1; then
+                    PKG=yum; CFN_CONFIGSET=rpm
+                  elif command -v apt-get >/dev/null 2>&1; then
+                    PKG=apt; CFN_CONFIGSET=apt
+                  else
+                    echo "No supported package manager (dnf/yum/apt) found" >&2
+                    exit 1
+                  fi
+
+                  pkg_update() {
+                    case "$PKG" in
+                      apt) apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -y \
+                             -o Dpkg::Options::="--force-confdef" \
+                             -o Dpkg::Options::="--force-confold" upgrade ;;
+                      dnf) dnf -y upgrade ;;
+                      yum) yum -y update ;;
+                    esac
+                  }
+
+                  pkg_install() {
+                    case "$PKG" in
+                      apt) DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+                      dnf) dnf install -y "$@" ;;
+                      yum) yum install -y "$@" ;;
+                    esac
+                  }
+
+                  # Update && upgrade
+                  pkg_update
+
+                  ## CFN Initialization ##
+
+                  # aws CLI is preinstalled on Amazon Linux; install it elsewhere.
+                  command -v aws >/dev/null 2>&1 || pkg_install awscli
+
+                  # Locate cfn-bootstrap (preinstalled at /opt/aws/bin on Amazon
+                  # Linux) or install the Python 3 build (Debian/Ubuntu/RHEL).
+                  if [ -x /opt/aws/bin/cfn-init ]; then
+                    CFN_BIN=/opt/aws/bin
+                  elif [ -x /usr/local/bin/cfn-init ]; then
+                    CFN_BIN=/usr/local/bin
+                  else
+                    pkg_install python3-pip
+                    pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+                    CFN_BIN=/usr/local/bin
+                  fi
+
+                  # Normalize the cfn binaries under /opt/aws/bin so the static
+                  # cfn-hup reloader hook path is valid regardless of OS family.
+                  if [ "$CFN_BIN" != "/opt/aws/bin" ]; then
+                    mkdir -p /opt/aws/bin
+                    for b in cfn-init cfn-hup cfn-signal cfn-get-metadata; do
+                      [ -x "/opt/aws/bin/$b" ] || ln -sf "$CFN_BIN/$b" "/opt/aws/bin/$b"
+                    done
+                  fi
+
+                  # From here on, signal failure to CloudFormation on any error so
+                  # the stack fails fast instead of waiting for the timeout.
+                  trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackId} --resource ASGSpotFlet${TheHostname} --region ${AWS::Region}' ERR
+
+                  # Run cfn-init with the OS-specific config set. cfn-init installs
+                  # the files (common) and the packages block for this family
+                  # (apt_packages or rpm_packages) declaratively from the Metadata.
+                  /opt/aws/bin/cfn-init -v -c $CFN_CONFIGSET \
+                    -s ${AWS::StackId} -r ASGSpotFlet${TheHostname} --region ${AWS::Region}
+
+                  # Start cfn-hup daemon so it keeps listening for Metadata changes.
+                  /opt/aws/bin/cfn-hup
+
+                  ## Extras that cfn-init's declarative 'packages' can't express ##
+                  # Kernel headers must be pinned to the running kernel via uname,
+                  # which is a runtime value with no static package name.
+                  case "$PKG" in
+                    apt)
+                      pkg_install "linux-headers-$(uname -r)"
+                      ;;
+                    dnf|yum)
+                      pkg_install "kernel-devel-$(uname -r)"
+                      # Compose is a dnf plugin on RHEL-family repos, not a package.
+                      pkg_install docker-compose-plugin || true
+                      ;;
+                  esac
+
+                  # Enable the docker daemon if it was installed.
+                  systemctl enable --now docker 2>/dev/null || true
+
+                  # Ensure the SSM agent is present and running so Session Manager
+                  # works (primary access path when no key pair is supplied).
+                  # Preinstalled on Amazon Linux; install elsewhere. Service name is
+                  # 'amazon-ssm-agent' (rpm) or 'snap.amazon-ssm-agent.amazon-ssm-agent'
+                  # on Ubuntu (snap), so enable whichever unit exists.
+                  if ! systemctl list-unit-files 2>/dev/null | grep -q ssm-agent; then
+                    case "$PKG" in
+                      apt) snap install amazon-ssm-agent --classic 2>/dev/null || \
+                           pkg_install amazon-ssm-agent || true ;;
+                      dnf|yum) pkg_install amazon-ssm-agent || true ;;
+                    esac
+                  fi
+                  systemctl enable --now amazon-ssm-agent 2>/dev/null || \
+                    systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent 2>/dev/null || true
+
+                  # IMDSv2 token (used for both the data volume and the EIP below).
+                  TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+                            -H "X-aws-ec2-metadata-token-ttl-seconds: 300" || true)
+                  imds() { curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+                            "http://169.254.169.254/latest/meta-data/$1"; }
+                  INSTANCE_ID=$(imds instance-id)
+
+                  ## Persistent data volume (attach the CloudFormation-managed EBS) ##
+                  # Only when PersistentStorage=yes. The volume is created and owned
+                  # by CloudFormation (the DataVolume resource) in the same AZ the
+                  # ASG is pinned to; here we just find it by its Name tag, attach,
+                  # and mount. Data survives because we format ONLY when it's blank.
+                  if [ "${PersistentStorage}" = "yes" ]; then
+                    AZ=$(imds placement/availability-zone)
+                    VOL_NAME="${TheHostname}-data"
+                    MP="${DataMountPoint}"
+
+                    # ASG and DataVolume are created concurrently (no static
+                    # DependsOn is possible on a conditional resource), so poll
+                    # until CloudFormation has created the volume.
+                    VOL_ID=""
+                    for i in $(seq 1 30); do
+                      VOL_ID=$(aws --region ${AWS::Region} ec2 describe-volumes \
+                        --filters "Name=tag:Name,Values=$VOL_NAME" \
+                                  "Name=availability-zone,Values=$AZ" \
+                        --query 'Volumes[0].VolumeId' --output text)
+                      [ "$VOL_ID" != "None" ] && [ -n "$VOL_ID" ] && break
+                      sleep 10
+                    done
+
+                    aws --region ${AWS::Region} ec2 wait volume-available --volume-ids "$VOL_ID"
+                    aws --region ${AWS::Region} ec2 attach-volume \
+                      --volume-id "$VOL_ID" --instance-id "$INSTANCE_ID" --device /dev/sdf
+
+                    # Resolve the device: Nitro renames /dev/sdf to a /dev/nvmeXn1
+                    # whose serial encodes the volume id (vol-xxxx, no dash).
+                    VOL_SERIAL=$(echo "$VOL_ID" | tr -d '-')
+                    DEV=""
+                    for i in $(seq 1 30); do
+                      if [ -e /dev/sdf ]; then DEV=/dev/sdf; break; fi
+                      for d in /dev/nvme*n1; do
+                        [ -e "$d" ] || continue
+                        if nvme id-ctrl -v "$d" 2>/dev/null | grep -q "$VOL_SERIAL"; then
+                          DEV="$d"; break
+                        fi
+                      done
+                      [ -n "$DEV" ] && break
+                      sleep 2
+                    done
+
+                    # Format only if there is no filesystem yet (preserves data).
+                    if ! blkid "$DEV" >/dev/null 2>&1; then
+                      mkfs.ext4 -L bastion-data "$DEV"
+                    fi
+
+                    # Mount by UUID via fstab (nofail so a bad volume never blocks boot).
+                    mkdir -p "$MP"
+                    UUID=$(blkid -s UUID -o value "$DEV")
+                    if ! grep -q "$UUID" /etc/fstab; then
+                      echo "UUID=$UUID $MP ext4 defaults,nofail 0 2" >> /etc/fstab
+                    fi
+                    mount -a
+                  fi
+
+                  # Change hostname (systemd first, fall back to legacy).
+                  hostnamectl set-hostname ${TheHostname} 2>/dev/null || {
+                    hostname ${TheHostname}
+                    echo ${TheHostname} > /etc/hostname
+                  }
+
+                  ## Associate the Elastic IP (only when AssignEIP=yes) ##
+                  # The EIP is a CloudFormation-managed resource tagged for this
+                  # host; look up its allocation id by tag and associate it to
+                  # this instance so a stable public IP survives Spot replacements.
+                  if [ "${AssignEIP}" = "yes" ]; then
+                    sleep 15
+                    ALLOC_ID=$(aws --region ${AWS::Region} ec2 describe-addresses \
+                      --filters "Name=tag:Name,Values=${TheHostname}-eip" \
+                      --query 'Addresses[0].AllocationId' --output text)
+                    aws --region ${AWS::Region} ec2 associate-address \
+                              --instance-id "$INSTANCE_ID" \
+                              --allocation-id "$ALLOC_ID"
+                  fi
+
+                  # Set SSH keepalive (~4h idle: 60m interval x 4).
+                  sed -i "/ClientAliveInterval/c\ClientAliveInterval 60m" /etc/ssh/sshd_config
+                  sed -i "/ClientAliveCountMax/c\ClientAliveCountMax 4" /etc/ssh/sshd_config
+                  # sshd service is 'ssh' on Debian/Ubuntu, 'sshd' on RHEL-family.
+                  systemctl restart sshd 2>/dev/null || systemctl restart ssh
+
+                  # As a last step, signal success to the stack.
+                  /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackId} --resource ASGSpotFlet${TheHostname} --region ${AWS::Region}
+
+      ###
+      # Per-bastion EIP (only when AssignEIP=yes)
+      ##
+      'BastionEIP${TheHostname}':
+        Type: AWS::EC2::EIP
+        Condition: UseEIP
+        Properties:
+          Domain: vpc
+          Tags:
+            - Key: Name
+              Value: !Sub '${TheHostname}-eip'
+
+      ###
+      # Per-bastion persistent data volume (only when PersistentStorage=yes)
+      ##
+      # A first-class, CloudFormation-managed EBS volume. Its AvailabilityZone
+      # is the same !Select [0, !GetAZs ''] the ASG is constrained to, so the
+      # volume and the instance always co-locate. Retained on stack delete so
+      # data is not lost; the attach happens at boot in UserData (an ASG has no
+      # static instance id for AWS::EC2::VolumeAttachment to reference).
+      'DataVolume${TheHostname}':
+        Type: AWS::EC2::Volume
+        Condition: UsePersistentStorage
+        DeletionPolicy: Retain
+        UpdateReplacePolicy: Retain
+        Properties:
+          AvailabilityZone: !Select [0, !GetAZs '']
+          Size: !Ref DataVolumeSize
+          VolumeType: gp3
+          Encrypted: true
+          Tags:
+            - Key: Name
+              Value: !Sub '${TheHostname}-data'
+
 
 ###
-# Outputs
+# Outputs (one set per bastion)
 ##
 Outputs:
-  BastionEIPAddress:
-    Condition: UseEIP
-    Description: The Elastic IP address of the Bastion Host.
-    Value: !Ref BastionEIP
+  Fn::ForEach::Outputs:
+    - TheHostname
+    - !Ref BastionNames
 
-  PersistentDataMountPoint:
-    Condition: UsePersistentStorage
-    Description: Path where the persistent, retained EBS data volume is mounted.
-    Value: !Ref DataMountPoint
+    - 'Bastion${TheHostname}EIP':
+        Condition: UseEIP
+        Description: !Sub 'Elastic IP address of bastion ${TheHostname}.'
+        # Cross-reference to a looped logical ID must wrap it in Fn::Sub.
+        Value: !Ref
+          'Fn::Sub': 'BastionEIP${TheHostname}'
+
+      'Bastion${TheHostname}DataMount':
+        Condition: UsePersistentStorage
+        Description: !Sub 'Mount point of the persistent data volume on bastion ${TheHostname}.'
+        Value: !Ref DataMountPoint
