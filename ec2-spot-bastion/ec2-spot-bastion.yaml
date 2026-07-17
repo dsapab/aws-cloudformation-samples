@@ -14,9 +14,9 @@ Metadata:
         Label:
           default: "Server settings ..."
         Parameters:
-          - AMIid
+          - OSFamily
+          - RhelAmiId
           - InstanceType
-          - RootDeviceName
           - Keypair
           - TheHostname
       -
@@ -48,9 +48,28 @@ Parameters:
     Description: The EC2 Instance will be launched in this VPC.
     Type: AWS::EC2::VPC::Id
 
-  AMIid:
-    Description: The EC2 Instance will use this AMI.
-    Type: AWS::EC2::Image::Id
+  OSFamily:
+    Description: >
+      Operating system to launch. The latest region-appropriate AMI and the
+      matching root device name are BOTH derived automatically from this one
+      choice (see the OSMap mapping), so there is nothing else to line up.
+      AmazonLinux2023 and Ubuntu resolve their AMI from a public SSM parameter;
+      RHEL has no public SSM parameter, so it uses the RhelAmiId value instead.
+    Type: String
+    Default: AmazonLinux2023
+    AllowedValues:
+      - AmazonLinux2023
+      - Ubuntu
+      - RHEL
+
+  RhelAmiId:
+    Description: >
+      AMI id to use ONLY when OSFamily=RHEL (Red Hat publishes no public SSM
+      parameter). Ignored for the other OS families. Leave as-is otherwise.
+    Type: String
+    Default: ''
+    # Empty (unused) or a syntactically valid AMI id.
+    AllowedPattern: '^(ami-([0-9a-f]{8}|[0-9a-f]{17}))?$'
 
   Keypair:
     Description: >
@@ -63,17 +82,6 @@ Parameters:
     Description: EC2 Instance type.
     Type: String
     Default: t3.large
-
-  RootDeviceName:
-    Description: >
-      EBS root device name. Must match the AMI's OS family, otherwise the
-      root volume size override is silently ignored. Typically /dev/xvda for
-      Amazon Linux / RHEL-family AMIs and /dev/sda1 for Ubuntu/Debian AMIs.
-    Type: String
-    Default: /dev/xvda
-    AllowedValues:
-      - /dev/xvda
-      - /dev/sda1
 
   SourceIP:
     Description: Source IP, for locking incoming SSH connections.
@@ -124,12 +132,35 @@ Parameters:
     Default: /data
 
 ##
+# Mappings
+#
+# Single source of truth that ties each OSFamily to BOTH its AMI source and
+# its root device name, so the two can never be mismatched. SsmPath holds the
+# public SSM parameter path used to resolve the latest AMI (empty for RHEL,
+# which has no public parameter and uses RhelAmiId instead).
+Mappings:
+  OSMap:
+    AmazonLinux2023:
+      SsmPath: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+      RootDevice: /dev/xvda
+    Ubuntu:
+      SsmPath: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+      RootDevice: /dev/sda1
+    RHEL:
+      SsmPath: ''
+      RootDevice: /dev/xvda
+
+##
 # Conditions
 #
 Conditions:
   # True when a key pair name was supplied; when false the launch template
   # omits KeyName entirely and access is via SSM Session Manager only.
   HasKeypair: !Not [!Equals [!Ref Keypair, '']]
+
+  # True for RHEL, which has no public SSM parameter and therefore takes its
+  # AMI id from RhelAmiId rather than a {{resolve:ssm:...}} lookup.
+  IsRhel: !Equals [!Ref OSFamily, 'RHEL']
 
   # True when a persistent EBS data volume should be created and the ASG
   # pinned to that volume's AZ.
@@ -267,16 +298,34 @@ Resources:
   ##
   ASGSpotFletLT:
     Type: AWS::EC2::LaunchTemplate
+    Metadata:
+      # W1030 false positive: linter checks RhelAmiId's empty default against
+      # the AMI-id pattern without following the !If [IsRhel, ...] guard. The
+      # empty value only reaches ImageId when OSFamily=RHEL, in which case a
+      # valid id is required (and enforced by the parameter's AllowedPattern).
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W1030
     Properties:
       LaunchTemplateData:
-        ImageId: !Ref AMIid
+        # AMI: RHEL uses the raw id (no public SSM param); the others resolve
+        # the latest region-appropriate AMI from the SSM path in OSMap.
+        ImageId: !If
+          - IsRhel
+          - !Ref RhelAmiId
+          - !Sub
+            - '{{resolve:ssm:${Path}}}'
+            - Path: !FindInMap [OSMap, !Ref OSFamily, SsmPath]
         InstanceType: !Ref InstanceType
         KeyName: !If [HasKeypair, !Ref Keypair, !Ref 'AWS::NoValue']
         SecurityGroupIds: [ !Ref ASGSpotFletSG ]
         IamInstanceProfile:
           Name: !Ref BastionInstanceProfile
         BlockDeviceMappings:
-          - DeviceName: !Ref RootDeviceName
+          # Root device name is derived from OSFamily, so it always matches
+          # the AMI (otherwise the size override would be silently ignored).
+          - DeviceName: !FindInMap [OSMap, !Ref OSFamily, RootDevice]
             Ebs:
               VolumeSize: 25
         UserData:
