@@ -26,6 +26,13 @@ Metadata:
           - VPC
           - Subnet
           - SourceIP
+      -
+        Label:
+          default: "Persistent storage (optional) ..."
+        Parameters:
+          - PersistentStorage
+          - DataVolumeSize
+          - DataMountPoint
 
 ##
 # Template parameter's
@@ -78,6 +85,30 @@ Parameters:
     Type: String
     Default: 'the-bastion-host'
 
+  PersistentStorage:
+    Description: >
+      'yes' provisions a retained, encrypted EBS data volume and PINS the
+      instance to a single Availability Zone (chosen automatically) so the
+      volume can re-attach across Spot replacements. 'no' uses ephemeral
+      root-only storage and lets Spot place the instance in any AZ (cheapest).
+    Type: String
+    Default: 'no'
+    AllowedValues:
+      - 'yes'
+      - 'no'
+
+  DataVolumeSize:
+    Description: Size (GiB) of the persistent data volume. Only used when PersistentStorage=yes.
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 200
+
+  DataMountPoint:
+    Description: Filesystem path where the persistent data volume is mounted. Only used when PersistentStorage=yes.
+    Type: String
+    Default: /data
+
 ##
 # Conditions
 #
@@ -85,6 +116,10 @@ Conditions:
   # True when a key pair name was supplied; when false the launch template
   # omits KeyName entirely and access is via SSM Session Manager only.
   HasKeypair: !Not [!Equals [!Ref Keypair, '']]
+
+  # True when a persistent EBS data volume should be created and the ASG
+  # pinned to that volume's AZ.
+  UsePersistentStorage: !Equals [!Ref PersistentStorage, 'yes']
 
 Resources:
 
@@ -154,6 +189,7 @@ Resources:
                     curl: []
                     telnet: []
                     nmap: []
+                    nvme-cli: []
                     docker.io: []
                     docker-compose: []
         rpm_packages:
@@ -166,6 +202,7 @@ Resources:
                     curl: []
                     telnet: []
                     nmap: []
+                    nvme-cli: []
                     docker: []
     Properties:
       MixedInstancesPolicy:
@@ -184,10 +221,19 @@ Resources:
       MinSize: '1'
       MaxSize: '1'
       DesiredCapacity: '1'
-      # AZs -> choose either 'VPCZoneIdentifier' or 'AvailabilityZones'
       VPCZoneIdentifier: !Ref Subnet
-      #AvailabilityZones:
-      #  Fn::GetAZs: ""
+      # AZ placement:
+      #  - Ephemeral (default): no AZ constraint, so Spot places the instance
+      #    in whichever of your subnets' AZs is cheapest.
+      #  - Persistent: constrain the ASG to the SAME AZ the DataVolume lives in
+      #    (!Select [0, !GetAZs ''] - the region's first AZ). The ASG launches
+      #    only in the supplied subnet that is in that AZ; if none exists it
+      #    fails loudly rather than orphaning the volume. This is the same
+      #    expression the DataVolume uses, so the two can never diverge.
+      AvailabilityZones: !If
+        - UsePersistentStorage
+        - - !Select [0, !GetAZs '']
+        - !Ref 'AWS::NoValue'
       Tags:
         -
           Key: "Name"
@@ -327,18 +373,78 @@ Resources:
               systemctl enable --now amazon-ssm-agent 2>/dev/null || \
                 systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent 2>/dev/null || true
 
+              # IMDSv2 token (used for both the data volume and the EIP below).
+              TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+                        -H "X-aws-ec2-metadata-token-ttl-seconds: 300" || true)
+              imds() { curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+                        "http://169.254.169.254/latest/meta-data/$1"; }
+              INSTANCE_ID=$(imds instance-id)
+
+              ## Persistent data volume (attach the CloudFormation-managed EBS) ##
+              # Only when PersistentStorage=yes. The volume is created and owned
+              # by CloudFormation (the DataVolume resource) in the same AZ the
+              # ASG is pinned to; here we just find it by its Name tag, attach,
+              # and mount. Data survives because we format ONLY when it's blank.
+              if [ "${PersistentStorage}" = "yes" ]; then
+                AZ=$(imds placement/availability-zone)
+                VOL_NAME="${TheHostname}-data"
+                MP="${DataMountPoint}"
+
+                # ASG and DataVolume are created concurrently (no static
+                # DependsOn is possible on a conditional resource), so poll
+                # until CloudFormation has created the volume.
+                VOL_ID=""
+                for i in $(seq 1 30); do
+                  VOL_ID=$(aws --region ${AWS::Region} ec2 describe-volumes \
+                    --filters "Name=tag:Name,Values=$VOL_NAME" \
+                              "Name=availability-zone,Values=$AZ" \
+                    --query 'Volumes[0].VolumeId' --output text)
+                  [ "$VOL_ID" != "None" ] && [ -n "$VOL_ID" ] && break
+                  sleep 10
+                done
+
+                aws --region ${AWS::Region} ec2 wait volume-available --volume-ids "$VOL_ID"
+                aws --region ${AWS::Region} ec2 attach-volume \
+                  --volume-id "$VOL_ID" --instance-id "$INSTANCE_ID" --device /dev/sdf
+
+                # Resolve the device: Nitro renames /dev/sdf to a /dev/nvmeXn1
+                # whose serial encodes the volume id (vol-xxxx, no dash).
+                VOL_SERIAL=$(echo "$VOL_ID" | tr -d '-')
+                DEV=""
+                for i in $(seq 1 30); do
+                  if [ -e /dev/sdf ]; then DEV=/dev/sdf; break; fi
+                  for d in /dev/nvme*n1; do
+                    [ -e "$d" ] || continue
+                    if nvme id-ctrl -v "$d" 2>/dev/null | grep -q "$VOL_SERIAL"; then
+                      DEV="$d"; break
+                    fi
+                  done
+                  [ -n "$DEV" ] && break
+                  sleep 2
+                done
+
+                # Format only if there is no filesystem yet (preserves data).
+                if ! blkid "$DEV" >/dev/null 2>&1; then
+                  mkfs.ext4 -L bastion-data "$DEV"
+                fi
+
+                # Mount by UUID via fstab (nofail so a bad volume never blocks boot).
+                mkdir -p "$MP"
+                UUID=$(blkid -s UUID -o value "$DEV")
+                if ! grep -q "$UUID" /etc/fstab; then
+                  echo "UUID=$UUID $MP ext4 defaults,nofail 0 2" >> /etc/fstab
+                fi
+                mount -a
+              fi
+
               # Change hostname (systemd first, fall back to legacy).
               hostnamectl set-hostname ${TheHostname} 2>/dev/null || {
                 hostname ${TheHostname}
                 echo ${TheHostname} > /etc/hostname
               }
 
-              # Associate the EIP (IMDSv2 token, falls back to IMDSv1).
+              # Associate the EIP (INSTANCE_ID resolved above via IMDSv2).
               sleep 15
-              TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
-                        -H "X-aws-ec2-metadata-token-ttl-seconds: 300" || true)
-              INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
-                        http://169.254.169.254/latest/meta-data/instance-id)
               aws --region ${AWS::Region} ec2 associate-address \
                         --instance-id "$INSTANCE_ID" \
                         --allocation-id ${BastionEIP.AllocationId}
@@ -373,6 +479,28 @@ Resources:
     Type: AWS::EC2::EIP
 
   ###
+  # Persistent data volume (only when PersistentStorage=yes)
+  ##
+  # A first-class, CloudFormation-managed EBS volume. Its AvailabilityZone is
+  # the same !Select [0, !GetAZs ''] the ASG is constrained to, so the volume
+  # and the instance always co-locate. Retained on stack delete so data is not
+  # lost; the attach happens at boot in UserData (an ASG has no static instance
+  # id for AWS::EC2::VolumeAttachment to reference).
+  DataVolume:
+    Type: AWS::EC2::Volume
+    Condition: UsePersistentStorage
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Size: !Ref DataVolumeSize
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${TheHostname}-data'
+
+  ###
   # IAM / Security configuration
   ##
   BastionInstanceRole:
@@ -403,6 +531,16 @@ Resources:
             - ec2:AssociateAddress
             - ec2:DisassociateAddress
             Resource: '*'
+          - !If
+            - UsePersistentStorage
+            - Sid: PersistentDataVolume
+              Effect: Allow
+              Action:
+              # Find (by tag) and attach the CloudFormation-managed data volume.
+              - ec2:DescribeVolumes
+              - ec2:AttachVolume
+              Resource: '*'
+            - !Ref 'AWS::NoValue'
           # - Sid: S3Access
           #   Effect: Allow
           #   Action:
@@ -426,3 +564,8 @@ Outputs:
   BastionEIPAddress:
     Description: The IP address of the Bastion Host.
     Value: !Ref BastionEIP
+
+  PersistentDataMountPoint:
+    Condition: UsePersistentStorage
+    Description: Path where the persistent, retained EBS data volume is mounted.
+    Value: !Ref DataMountPoint
