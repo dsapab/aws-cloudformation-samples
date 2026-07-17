@@ -16,6 +16,7 @@ Metadata:
         Parameters:
           - AMIid
           - InstanceType
+          - RootDeviceName
           - Keypair
           - TheHostname
       -
@@ -44,13 +45,27 @@ Parameters:
     Type: AWS::EC2::Image::Id
 
   Keypair:
-    Description: SSH Key pair.
-    Type: AWS::EC2::KeyPair::KeyName
+    Description: >
+      Optional SSH key pair name. Leave blank to launch without an SSH key
+      and rely on SSM Session Manager for access.
+    Type: String
+    Default: ''
 
   InstanceType:
     Description: EC2 Instance type.
     Type: String
     Default: t3.large
+
+  RootDeviceName:
+    Description: >
+      EBS root device name. Must match the AMI's OS family, otherwise the
+      root volume size override is silently ignored. Typically /dev/xvda for
+      Amazon Linux / RHEL-family AMIs and /dev/sda1 for Ubuntu/Debian AMIs.
+    Type: String
+    Default: /dev/xvda
+    AllowedValues:
+      - /dev/xvda
+      - /dev/sda1
 
   SourceIP:
     Description: Source IP, for locking incoming SSH connections.
@@ -62,6 +77,14 @@ Parameters:
     Description: The hostname for the bastion server.
     Type: String
     Default: 'the-bastion-host'
+
+##
+# Conditions
+#
+Conditions:
+  # True when a key pair name was supplied; when false the launch template
+  # omits KeyName entirely and access is via SSM Session Manager only.
+  HasKeypair: !Not [!Equals [!Ref Keypair, '']]
 
 Resources:
 
@@ -86,7 +109,21 @@ Resources:
     Metadata:
       Comment: "Spot Bastion host"
       AWS::CloudFormation::Init:
-        config:
+        # The UserData shim detects the OS family and invokes cfn-init with
+        # '-c apt' or '-c rpm'. cfn-init runs ONLY the configs in the chosen
+        # set, so package names are resolved per family declaratively instead
+        # of in shell. The 'default' set (files only) is what the cfn-hup
+        # auto-reloader re-applies on stack updates.
+        configSets:
+          default:
+            - common
+          apt:
+            - common
+            - apt_packages
+          rpm:
+            - common
+            - rpm_packages
+        common:
             files:
                 "/etc/cfn/cfn-hup.conf":
                   content: !Sub |
@@ -102,11 +139,34 @@ Resources:
                   content: !Sub |
                     [cfn-auto-reloader-hook]
                     triggers=post.update
-                    path=Resources.MyVMInstance.Metadata.AWS::CloudFormation::Init
+                    path=Resources.ASGSpotFletLT.Metadata.AWS::CloudFormation::Init
                     action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource ASGSpotFlet --region ${AWS::Region}
                   mode: "000400"
                   owner: "root"
                   group: "root"
+        apt_packages:
+            packages:
+                apt:
+                    htop: []
+                    unzip: []
+                    git: []
+                    gcc: []
+                    curl: []
+                    telnet: []
+                    nmap: []
+                    docker.io: []
+                    docker-compose: []
+        rpm_packages:
+            packages:
+                yum:
+                    htop: []
+                    unzip: []
+                    git: []
+                    gcc: []
+                    curl: []
+                    telnet: []
+                    nmap: []
+                    docker: []
     Properties:
       MixedInstancesPolicy:
         InstancesDistribution:
@@ -143,12 +203,12 @@ Resources:
       LaunchTemplateData:
         ImageId: !Ref AMIid
         InstanceType: !Ref InstanceType
-        KeyName: !Ref Keypair
+        KeyName: !If [HasKeypair, !Ref Keypair, !Ref 'AWS::NoValue']
         SecurityGroupIds: [ !Ref ASGSpotFletSG ]
         IamInstanceProfile:
           Name: !Ref BastionInstanceProfile
         BlockDeviceMappings:
-          - DeviceName: /dev/sda1
+          - DeviceName: !Ref RootDeviceName
             Ebs:
               VolumeSize: 25
         UserData:
@@ -156,53 +216,141 @@ Resources:
             !Sub |
               #!/bin/bash -xe
 
+              ###
+              # OS-agnostic package-manager abstraction.
+              # Supports apt (Debian/Ubuntu) and dnf/yum (Amazon Linux, RHEL,
+              # CentOS, Rocky). Everything below is expressed through these
+              # helpers so the same UserData boots on any of those families.
+              ##
+              # PKG drives the shell helpers; CFN_CONFIGSET selects which
+              # cfn-init packages block runs (apt block vs yum/rpm block).
+              if command -v dnf >/dev/null 2>&1; then
+                PKG=dnf; CFN_CONFIGSET=rpm
+              elif command -v yum >/dev/null 2>&1; then
+                PKG=yum; CFN_CONFIGSET=rpm
+              elif command -v apt-get >/dev/null 2>&1; then
+                PKG=apt; CFN_CONFIGSET=apt
+              else
+                echo "No supported package manager (dnf/yum/apt) found" >&2
+                exit 1
+              fi
+
+              pkg_update() {
+                case "$PKG" in
+                  apt) apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -y \
+                         -o Dpkg::Options::="--force-confdef" \
+                         -o Dpkg::Options::="--force-confold" upgrade ;;
+                  dnf) dnf -y upgrade ;;
+                  yum) yum -y update ;;
+                esac
+              }
+
+              pkg_install() {
+                case "$PKG" in
+                  apt) DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+                  dnf) dnf install -y "$@" ;;
+                  yum) yum install -y "$@" ;;
+                esac
+              }
+
               # Update && upgrade
-              apt-get update && DEBIAN_FRONTEND=noninteractive \
-                                apt-get -y \
-                                -o Dpkg::Options::="--force-confdef" \
-                                -o Dpkg::Options::="--force-confold" \
-                                upgrade
+              pkg_update
 
               ## CFN Initialization ##
 
-              # Install scripts
-              apt-get -y install python-pip
-              pip install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz awscli
+              # aws CLI is preinstalled on Amazon Linux; install it elsewhere.
+              command -v aws >/dev/null 2>&1 || pkg_install awscli
 
-              # Start cfn-init to Install all Metadata content (packages, sources, files, commands and services )
-              /usr/local/bin/cfn-init -s ${AWS::StackId} -r ASGSpotFlet --region ${AWS::Region} || error_exit 'Failed to run cfn-init'
+              # Locate cfn-bootstrap (preinstalled at /opt/aws/bin on Amazon
+              # Linux) or install the Python 3 build (Debian/Ubuntu/RHEL).
+              if [ -x /opt/aws/bin/cfn-init ]; then
+                CFN_BIN=/opt/aws/bin
+              elif [ -x /usr/local/bin/cfn-init ]; then
+                CFN_BIN=/usr/local/bin
+              else
+                pkg_install python3-pip
+                pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+                CFN_BIN=/usr/local/bin
+              fi
 
-              # Start cfn-hup daemon so that it will keep listening to any changes to EC2 Instance Metadata.
-              /usr/local/bin/cfn-hup || error_exit 'Failed to start cfn-hup'
+              # Normalize the cfn binaries under /opt/aws/bin so the static
+              # cfn-hup reloader hook path is valid regardless of OS family.
+              if [ "$CFN_BIN" != "/opt/aws/bin" ]; then
+                mkdir -p /opt/aws/bin
+                for b in cfn-init cfn-hup cfn-signal cfn-get-metadata; do
+                  [ -x "/opt/aws/bin/$b" ] || ln -sf "$CFN_BIN/$b" "/opt/aws/bin/$b"
+                done
+              fi
 
-              # Install and setup the instance ##
-              apt-get install -y  linux-headers-$(uname -r) \
-                                  htop \
-                                  unzip \
-                                  docker.io \
-                                  docker-compose \
-                                  git \
-                                  gcc \
-                                  curl \
-                                  telnet \
-                                  nmap
+              # From here on, signal failure to CloudFormation on any error so
+              # the stack fails fast instead of waiting for the timeout.
+              trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackId} --resource ASGSpotFlet --region ${AWS::Region}' ERR
 
-              # Change hostname
-              hostname ${TheHostname}
-              echo ${TheHostname} > /etc/hostname
+              # Run cfn-init with the OS-specific config set. cfn-init installs
+              # the files (common) and the packages block for this family
+              # (apt_packages or rpm_packages) declaratively from the Metadata.
+              /opt/aws/bin/cfn-init -v -c $CFN_CONFIGSET \
+                -s ${AWS::StackId} -r ASGSpotFlet --region ${AWS::Region}
 
-              # Associate the EIP
+              # Start cfn-hup daemon so it keeps listening for Metadata changes.
+              /opt/aws/bin/cfn-hup
+
+              ## Extras that cfn-init's declarative 'packages' can't express ##
+              # Kernel headers must be pinned to the running kernel via uname,
+              # which is a runtime value with no static package name.
+              case "$PKG" in
+                apt)
+                  pkg_install "linux-headers-$(uname -r)"
+                  ;;
+                dnf|yum)
+                  pkg_install "kernel-devel-$(uname -r)"
+                  # Compose is a dnf plugin on RHEL-family repos, not a package.
+                  pkg_install docker-compose-plugin || true
+                  ;;
+              esac
+
+              # Enable the docker daemon if it was installed.
+              systemctl enable --now docker 2>/dev/null || true
+
+              # Ensure the SSM agent is present and running so Session Manager
+              # works (primary access path when no key pair is supplied).
+              # Preinstalled on Amazon Linux; install elsewhere. Service name is
+              # 'amazon-ssm-agent' (rpm) or 'snap.amazon-ssm-agent.amazon-ssm-agent'
+              # on Ubuntu (snap), so enable whichever unit exists.
+              if ! systemctl list-unit-files 2>/dev/null | grep -q ssm-agent; then
+                case "$PKG" in
+                  apt) snap install amazon-ssm-agent --classic 2>/dev/null || \
+                       pkg_install amazon-ssm-agent || true ;;
+                  dnf|yum) pkg_install amazon-ssm-agent || true ;;
+                esac
+              fi
+              systemctl enable --now amazon-ssm-agent 2>/dev/null || \
+                systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent 2>/dev/null || true
+
+              # Change hostname (systemd first, fall back to legacy).
+              hostnamectl set-hostname ${TheHostname} 2>/dev/null || {
+                hostname ${TheHostname}
+                echo ${TheHostname} > /etc/hostname
+              }
+
+              # Associate the EIP (IMDSv2 token, falls back to IMDSv1).
               sleep 15
-              INSTANCE_ID=$(curl --silent http://169.254.169.254/latest/meta-data/instance-id)
-              aws --region ${AWS::Region} ec2 associate-address --instance-id "$INSTANCE_ID" --allocation-id ${BastionEIP.AllocationId}
+              TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+                        -H "X-aws-ec2-metadata-token-ttl-seconds: 300" || true)
+              INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+                        http://169.254.169.254/latest/meta-data/instance-id)
+              aws --region ${AWS::Region} ec2 associate-address \
+                        --instance-id "$INSTANCE_ID" \
+                        --allocation-id ${BastionEIP.AllocationId}
 
-              # Set SSH timeout to 4 hours
+              # Set SSH keepalive (~4h idle: 60m interval x 4).
               sed -i "/ClientAliveInterval/c\ClientAliveInterval 60m" /etc/ssh/sshd_config
-              sed -i "/ClientAliveCountMax/c\ClientAliveInterval 4" /etc/ssh/sshd_config
-              systemctl restart sshd
+              sed -i "/ClientAliveCountMax/c\ClientAliveCountMax 4" /etc/ssh/sshd_config
+              # sshd service is 'ssh' on Debian/Ubuntu, 'sshd' on RHEL-family.
+              systemctl restart sshd 2>/dev/null || systemctl restart ssh
 
-              # As a last step, signal the stack...
-              /usr/local/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource ASGSpotFlet --region ${AWS::Region}
+              # As a last step, signal success to the stack.
+              /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackId} --resource ASGSpotFlet --region ${AWS::Region}
 
   ###
   # ASG Spot fleet SG
@@ -240,6 +388,10 @@ Resources:
           Action:
           - sts:AssumeRole
       Path: /
+      # Enables SSM Session Manager access (keyless SSH-free shell), which is
+      # the primary access path when no key pair is supplied.
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
       Policies:
       - PolicyName: BastionInstanceRole
         PolicyDocument:
