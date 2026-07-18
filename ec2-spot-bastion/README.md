@@ -40,7 +40,7 @@ An Auto Scaling group has no fixed instance id, so the template cannot bind an E
 
 ### Persistent disk and the AZ pin
 
-EBS volumes live in one Availability Zone and attach to one instance at a time. When `PersistentStorage=yes` the template creates an `AWS::EC2::Volume` (gp3, encrypted, `DeletionPolicy: Delete`) in the region's first AZ, and constrains the Auto Scaling group to that same AZ via `AvailabilityZones: !Select [0, !GetAZs '']`. The two use the identical expression, so the instance and its volume always land together. If none of your subnets is in that AZ the group fails to launch rather than orphaning the volume.
+EBS volumes live in one Availability Zone and attach to one instance at a time. When `PersistentStorage=yes` the template creates an `AWS::EC2::Volume` (gp3, encrypted, `DeletionPolicy: Delete`) in the region's first AZ, and constrains the Auto Scaling group to that same AZ via `AvailabilityZones: !Select [0, !GetAZs '']`. The two use the identical expression, so the instance and its volume always land together. This is why the `Subnet` you pass must be in the region's first AZ (the `...a` AZ) when persistent storage is on. If it is not, the group fails at creation rather than the volume failing to attach at boot.
 
 At boot the instance finds the volume by its `<name>-data` tag, attaches it, resolves the real device name (Nitro renames `/dev/sdf` to an `nvme` device whose serial encodes the volume id), formats it only when it is blank so existing data survives, and mounts it by UUID through `/etc/fstab` with `nofail`.
 
@@ -57,7 +57,7 @@ Names in `BastionNames` must be alphanumeric because they end up in resource log
 | Parameter | Default | Notes |
 |-----------|---------|-------|
 | `BastionNames` | `bastion1` | Comma-separated. One bastion per name. Alphanumeric only. |
-| `Subnet` | (required) | Candidate subnets for the Auto Scaling group. |
+| `Subnet` | (required) | Single subnet for the Auto Scaling group. Must be in the region's first AZ (`...a`) when `PersistentStorage=yes`. |
 | `VPC` | (required) | VPC for the security group. |
 | `OSFamily` | `AmazonLinux2023` | `AmazonLinux2023`, `Ubuntu`, or `RHEL`. |
 | `RhelAmiId` | `''` | AMI id used only when `OSFamily=RHEL`. |
@@ -87,7 +87,7 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
   --parameter-overrides \
     VPC=vpc-xxxx \
-    Subnet=subnet-aaaa,subnet-bbbb \
+    Subnet=subnet-aaaa \
     SourceIP=8.8.8.8/32
 ```
 
@@ -104,7 +104,7 @@ aws cloudformation deploy \
     PersistentStorage=yes \
     AssignEIP=no \
     VPC=vpc-xxxx \
-    Subnet=subnet-aaaa,subnet-bbbb
+    Subnet=subnet-aaaa
 ```
 
 `CAPABILITY_AUTO_EXPAND` is required because the template uses the `AWS::LanguageExtensions` transform. `CAPABILITY_IAM` covers the instance role.
@@ -121,6 +121,6 @@ A locked-down bastion runs with `Keypair` blank and `AssignEIP=no`, reachable on
 ## Things to know before scaling up
 
 - **EIP quota.** The default limit is 5 Elastic IPs per region. A larger fleet with `AssignEIP=yes` will hit it.
-- **One AZ under persistent storage.** Every bastion lands in the region's first AZ, so a single-AZ outage takes the whole persistent fleet down. Ephemeral deploys spread across your subnets' AZs instead.
+- **One AZ, one subnet.** All bastions share the single subnet you pass, so the whole fleet lives in one AZ and a single-AZ outage takes it down. Under persistent storage that subnet must be in the region's first AZ.
 - **The data volume is deleted with the stack.** `DeletionPolicy: Delete` means deleting the stack, or removing a name from `BastionNames`, destroys that volume and its data. Snapshot it first if you need to keep anything.
 - **`{{resolve:ssm}}` tracks latest.** A stack update can roll onto a newer AMI and trigger a rolling instance replacement. Pin with `{{resolve:ssm:<path>:<version>}}` if you need a fixed image.

@@ -65,8 +65,12 @@ Parameters:
     Default: bastion1
 
   Subnet:
-    Description: The EC2 Instance will be launched in this subnet.
-    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: >
+      Single subnet the bastions launch in. When PersistentStorage=yes this
+      subnet MUST be in the region's first Availability Zone (the '...a' AZ,
+      e.g. us-west-2a), because each data volume is pinned to that AZ and the
+      instance must sit in the same one. Pick a subnet in the 'a' AZ.
+    Type: AWS::EC2::Subnet::Id
 
   VPC:
     Description: The EC2 Instance will be launched in this VPC.
@@ -390,15 +394,16 @@ Resources:
           MinSize: '1'
           MaxSize: '1'
           DesiredCapacity: '1'
-          VPCZoneIdentifier: !Ref Subnet
+          # Single subnet, wrapped in a list as VPCZoneIdentifier requires.
+          VPCZoneIdentifier: [!Ref Subnet]
           # AZ placement:
-          #  - Ephemeral (default): no AZ constraint, so Spot places each
-          #    instance in whichever of your subnets' AZs is cheapest.
-          #  - Persistent: constrain every ASG to the SAME AZ its DataVolume
-          #    lives in (!Select [0, !GetAZs ''] - the region's first AZ). The
-          #    ASG launches only in the supplied subnet that is in that AZ; if
-          #    none exists it fails loudly rather than orphaning the volume.
-          #    NOTE: with persistent storage on, all bastions share that one AZ.
+          #  - Ephemeral (default): no AZ constraint; the instance launches in
+          #    the subnet's AZ.
+          #  - Persistent: also constrain the ASG to the region's first AZ
+          #    (!Select [0, !GetAZs '']), the AZ each DataVolume is pinned to.
+          #    If the chosen subnet is NOT in that AZ the ASG fails at creation
+          #    (fail fast) rather than the volume failing to attach at boot.
+          #    So the subnet MUST be in the '...a' AZ when persistence is on.
           AvailabilityZones: !If
             - UsePersistentStorage
             - - !Select [0, !GetAZs '']
