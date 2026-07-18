@@ -348,30 +348,27 @@ Resources:
                       owner: "root"
                       group: "root"
             apt_packages:
+                # Kept aligned with rpm_packages: only the always-present core
+                # here, optional tools and docker installed in the shell below.
                 packages:
                     apt:
-                        htop: []
                         unzip: []
                         git: []
                         gcc: []
-                        curl: []
-                        telnet: []
-                        nmap: []
                         nvme-cli: []
-                        docker.io: []
-                        docker-compose: []
             rpm_packages:
+                # Only packages present on BOTH Amazon Linux 2023 and RHEL
+                # (base/appstream) go here, because a single missing package
+                # fails the whole cfn-init build. The optional tools (htop,
+                # nmap, telnet) and docker are installed best-effort in the
+                # UserData shell below, since htop needs EPEL on RHEL and RHEL
+                # has no docker package (it ships podman).
                 packages:
                     yum:
-                        htop: []
                         unzip: []
                         git: []
                         gcc: []
-                        curl: []
-                        telnet: []
-                        nmap: []
                         nvme-cli: []
-                        docker: []
         Properties:
           MixedInstancesPolicy:
             InstancesDistribution:
@@ -536,10 +533,27 @@ Resources:
                   case "$PKG" in
                     apt)
                       pkg_install "linux-headers-$(uname -r)"
+                      # Optional tools and docker: apt has them all.
+                      pkg_install htop nmap telnet docker.io docker-compose || true
                       ;;
                     dnf|yum)
                       pkg_install "kernel-devel-$(uname -r)"
-                      # Compose is a dnf plugin on RHEL-family repos, not a package.
+                      # Optional tools installed best-effort (each on its own so
+                      # one missing package does not block the rest). htop needs
+                      # EPEL on RHEL, so enable it first; harmless on Amazon Linux.
+                      pkg_install epel-release 2>/dev/null \
+                        || dnf install -y \
+                             https://dl.fedoraproject.org/pub/epel/epel-release-latest-$(rpm -E %rhel).noarch.rpm \
+                             2>/dev/null || true
+                      for p in htop nmap telnet; do pkg_install "$p" || true; done
+                      # Docker: Amazon Linux ships a 'docker' package; RHEL does
+                      # not (it ships podman), so add Docker's CE repo there.
+                      if ! pkg_install docker 2>/dev/null; then
+                        dnf config-manager --add-repo \
+                          https://download.docker.com/linux/rhel/docker-ce.repo 2>/dev/null || true
+                        pkg_install docker-ce docker-ce-cli containerd.io docker-compose-plugin || true
+                      fi
+                      # Compose plugin on Amazon Linux repos (no-op if already present).
                       pkg_install docker-compose-plugin || true
                       ;;
                   esac
