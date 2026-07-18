@@ -667,13 +667,14 @@ Resources:
       ##
       # A first-class, CloudFormation-managed EBS volume. Its AvailabilityZone
       # is the same !Select [0, !GetAZs ''] the ASG is constrained to, so the
-      # volume and the instance always co-locate. Retained on stack delete so
-      # data is not lost; the attach happens at boot in UserData (an ASG has no
-      # static instance id for AWS::EC2::VolumeAttachment to reference).
+      # volume and the instance always co-locate. Deleted with the stack (and
+      # when a name is removed from BastionNames), so its data is NOT preserved;
+      # the attach happens at boot in UserData (an ASG has no static instance id
+      # for AWS::EC2::VolumeAttachment to reference).
       'DataVolume${TheHostname}':
         Type: AWS::EC2::Volume
         Condition: UsePersistentStorage
-        DeletionPolicy: Retain
+        DeletionPolicy: Delete
         UpdateReplacePolicy: Retain
         Properties:
           AvailabilityZone: !Select [0, !GetAZs '']

@@ -40,7 +40,7 @@ An Auto Scaling group has no fixed instance id, so the template cannot bind an E
 
 ### Persistent disk and the AZ pin
 
-EBS volumes live in one Availability Zone and attach to one instance at a time. When `PersistentStorage=yes` the template creates an `AWS::EC2::Volume` (gp3, encrypted, `DeletionPolicy: Retain`) in the region's first AZ, and constrains the Auto Scaling group to that same AZ via `AvailabilityZones: !Select [0, !GetAZs '']`. The two use the identical expression, so the instance and its volume always land together. If none of your subnets is in that AZ the group fails to launch rather than orphaning the volume.
+EBS volumes live in one Availability Zone and attach to one instance at a time. When `PersistentStorage=yes` the template creates an `AWS::EC2::Volume` (gp3, encrypted, `DeletionPolicy: Delete`) in the region's first AZ, and constrains the Auto Scaling group to that same AZ via `AvailabilityZones: !Select [0, !GetAZs '']`. The two use the identical expression, so the instance and its volume always land together. If none of your subnets is in that AZ the group fails to launch rather than orphaning the volume.
 
 At boot the instance finds the volume by its `<name>-data` tag, attaches it, resolves the real device name (Nitro renames `/dev/sdf` to an `nvme` device whose serial encodes the volume id), formats it only when it is blank so existing data survives, and mounts it by UUID through `/etc/fstab` with `nofail`.
 
@@ -65,7 +65,7 @@ Names in `BastionNames` must be alphanumeric because they end up in resource log
 | `InstanceType` | `t3.large` | |
 | `SourceIP` | `0.0.0.0/0` | CIDR allowed to reach port 22. |
 | `AssignEIP` | `yes` | One Elastic IP per bastion when `yes`. |
-| `PersistentStorage` | `no` | One retained EBS volume per bastion, plus an AZ pin, when `yes`. |
+| `PersistentStorage` | `no` | One EBS volume per bastion, plus an AZ pin, when `yes`. Volume is deleted with the stack. |
 | `DataVolumeSize` | `20` | GiB, 1 to 200. Used only with persistent storage. |
 | `DataMountPoint` | `/data` | Mount path. Used only with persistent storage. |
 
@@ -122,5 +122,5 @@ A locked-down bastion runs with `Keypair` blank and `AssignEIP=no`, reachable on
 
 - **EIP quota.** The default limit is 5 Elastic IPs per region. A larger fleet with `AssignEIP=yes` will hit it.
 - **One AZ under persistent storage.** Every bastion lands in the region's first AZ, so a single-AZ outage takes the whole persistent fleet down. Ephemeral deploys spread across your subnets' AZs instead.
-- **The data volume outlives the stack.** `DeletionPolicy: Retain` means deleting the stack leaves the volume (and its cost) behind. Remove it by hand when you are done with the data.
+- **The data volume is deleted with the stack.** `DeletionPolicy: Delete` means deleting the stack, or removing a name from `BastionNames`, destroys that volume and its data. Snapshot it first if you need to keep anything.
 - **`{{resolve:ssm}}` tracks latest.** A stack update can roll onto a newer AMI and trigger a rolling instance replacement. Pin with `{{resolve:ssm:<path>:<version>}}` if you need a fixed image.
