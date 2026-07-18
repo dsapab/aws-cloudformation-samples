@@ -13,6 +13,14 @@ Description: >
 # Metadata and organisation
 #
 Metadata:
+  # E6101 false positive: cfn-lint cannot resolve the Fn::ForEach-generated
+  # logical IDs referenced by the looped Outputs (!Ref {Fn::Sub: ...}), so it
+  # invents placeholder names and reports them as unknown. The transform
+  # resolves them correctly at deploy time.
+  cfn-lint:
+    config:
+      ignore_checks:
+        - E6101
   AWS::CloudFormation::Interface:
     ParameterGroups:
       -
@@ -184,7 +192,9 @@ Conditions:
   # True when the instance role needs any inline policy at all (i.e. the EIP
   # or the data volume is in use). When neither is, the role carries only the
   # SSM managed policy and the inline Policies block is omitted.
-  HasInlinePolicy: !Or [!Condition UseEIP, !Condition UsePersistentStorage]
+  HasInlinePolicy: !Or
+    - !Equals [!Ref AssignEIP, 'yes']
+    - !Equals [!Ref PersistentStorage, 'yes']
 
 Resources:
 
@@ -679,18 +689,24 @@ Resources:
 # Outputs (one set per bastion)
 ##
 Outputs:
-  Fn::ForEach::Outputs:
+  # A per-output 'Condition:' key inside an Outputs Fn::ForEach breaks the
+  # AWS::LanguageExtensions transform ("Condition layout is incorrect"), and
+  # AWS::NoValue cannot stand in as an entire output Value. So instead of
+  # conditioning each output, we condition the COLLECTION each loop iterates:
+  # !If [Cond, BastionNames, []] yields the full name list when the feature is
+  # on and an empty list (zero outputs) when it is off.
+  Fn::ForEach::EIPOutputs:
     - TheHostname
-    - !Ref BastionNames
-
+    - !If [UseEIP, !Ref BastionNames, []]
     - 'Bastion${TheHostname}EIP':
-        Condition: UseEIP
         Description: !Sub 'Elastic IP address of bastion ${TheHostname}.'
         # Cross-reference to a looped logical ID must wrap it in Fn::Sub.
         Value: !Ref
           'Fn::Sub': 'BastionEIP${TheHostname}'
 
-      'Bastion${TheHostname}DataMount':
-        Condition: UsePersistentStorage
+  Fn::ForEach::DataOutputs:
+    - TheHostname
+    - !If [UsePersistentStorage, !Ref BastionNames, []]
+    - 'Bastion${TheHostname}DataMount':
         Description: !Sub 'Mount point of the persistent data volume on bastion ${TheHostname}.'
         Value: !Ref DataMountPoint
