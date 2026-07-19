@@ -301,7 +301,7 @@ Resources:
             MinSuccessfulInstancesPercent: 100
           ResourceSignal:
             Count: 1
-            Timeout: PT10M
+            Timeout: PT15M
         UpdatePolicy:
           AutoScalingRollingUpdate:
             MaxBatchSize: 1
@@ -527,6 +527,23 @@ Resources:
                   # Start cfn-hup daemon so it keeps listening for Metadata changes.
                   /opt/aws/bin/cfn-hup
 
+                  # Ensure the SSM agent is present and running so Session Manager
+                  # works (primary access path when no key pair is supplied). This
+                  # runs BEFORE the optional-package installs below so that even if
+                  # one of those fails, the box is still reachable via SSM.
+                  # Preinstalled on Amazon Linux; snap on Ubuntu; on RHEL it is NOT
+                  # in the repos, so install Amazon's official region RPM.
+                  if ! systemctl list-unit-files 2>/dev/null | grep -q ssm-agent; then
+                    case "$PKG" in
+                      apt) snap install amazon-ssm-agent --classic 2>/dev/null || \
+                           pkg_install amazon-ssm-agent || true ;;
+                      dnf|yum) pkg_install amazon-ssm-agent 2>/dev/null || \
+                           dnf install -y "https://s3.${AWS::Region}.amazonaws.com/amazon-ssm-${AWS::Region}/latest/linux_amd64/amazon-ssm-agent.rpm" || true ;;
+                    esac
+                  fi
+                  systemctl enable --now amazon-ssm-agent 2>/dev/null || \
+                    systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent 2>/dev/null || true
+
                   ## Extras that cfn-init's declarative 'packages' can't express ##
                   # Kernel headers must be pinned to the running kernel via uname,
                   # which is a runtime value with no static package name.
@@ -537,7 +554,9 @@ Resources:
                       pkg_install htop nmap telnet docker.io docker-compose || true
                       ;;
                     dnf|yum)
-                      pkg_install "kernel-devel-$(uname -r)"
+                      # Best-effort: repo kernel-devel often lags the booted
+                      # kernel on RHEL, and must not abort the boot.
+                      pkg_install "kernel-devel-$(uname -r)" || true
                       # Optional tools installed best-effort (each on its own so
                       # one missing package does not block the rest). htop needs
                       # EPEL on RHEL, so enable it first; harmless on Amazon Linux.
@@ -560,21 +579,6 @@ Resources:
 
                   # Enable the docker daemon if it was installed.
                   systemctl enable --now docker 2>/dev/null || true
-
-                  # Ensure the SSM agent is present and running so Session Manager
-                  # works (primary access path when no key pair is supplied).
-                  # Preinstalled on Amazon Linux; install elsewhere. Service name is
-                  # 'amazon-ssm-agent' (rpm) or 'snap.amazon-ssm-agent.amazon-ssm-agent'
-                  # on Ubuntu (snap), so enable whichever unit exists.
-                  if ! systemctl list-unit-files 2>/dev/null | grep -q ssm-agent; then
-                    case "$PKG" in
-                      apt) snap install amazon-ssm-agent --classic 2>/dev/null || \
-                           pkg_install amazon-ssm-agent || true ;;
-                      dnf|yum) pkg_install amazon-ssm-agent || true ;;
-                    esac
-                  fi
-                  systemctl enable --now amazon-ssm-agent 2>/dev/null || \
-                    systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent 2>/dev/null || true
 
                   # IMDSv2 token (used for both the data volume and the EIP below).
                   TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
