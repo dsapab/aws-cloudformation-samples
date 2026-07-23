@@ -565,9 +565,13 @@ Resources:
                   # which is a runtime value with no static package name.
                   case "$PKG" in
                     apt)
-                      pkg_install "linux-headers-$(uname -r)"
-                      # Optional tools and docker: apt has them all.
-                      pkg_install htop nmap telnet docker.io docker-compose || true
+                      # Best-effort, each on its own so one missing package
+                      # does not drop the rest (headers may lag the -aws kernel).
+                      pkg_install "linux-headers-$(uname -r)" || true
+                      for p in htop nmap telnet docker.io; do pkg_install "$p" || true; done
+                      # Compose v2 plugin; the v1 'docker-compose' package was
+                      # dropped in Ubuntu 24.04, so fall back to it only if present.
+                      pkg_install docker-compose-v2 || pkg_install docker-compose || true
                       ;;
                     dnf|yum)
                       # Best-effort: repo kernel-devel often lags the booted
@@ -645,6 +649,13 @@ Resources:
                       [ -n "$DEV" ] && break
                       sleep 2
                     done
+
+                    # Bail clearly if the volume never showed up, rather than
+                    # running mkfs against an empty device string below.
+                    if [ -z "$DEV" ]; then
+                      echo "Data volume device not found after attach; aborting." >&2
+                      exit 1
+                    fi
 
                     # Format only if there is no filesystem yet (preserves data).
                     if ! blkid "$DEV" >/dev/null 2>&1; then
