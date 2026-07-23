@@ -489,9 +489,9 @@ Resources:
                   pkg_update
 
                   ## CFN Initialization ##
-
-                  # aws CLI is preinstalled on Amazon Linux; install it elsewhere.
-                  command -v aws >/dev/null 2>&1 || pkg_install awscli
+                  # Note: the aws CLI is installed later (after SSM setup), since
+                  # cfn-init and cfn-hup do not need it and it must not block the
+                  # boot before the box is reachable via SSM.
 
                   # Locate cfn-bootstrap (preinstalled at /opt/aws/bin on Amazon
                   # Linux) or install the Python 3 build (Debian/Ubuntu/RHEL).
@@ -501,7 +501,12 @@ Resources:
                     CFN_BIN=/usr/local/bin
                   else
                     pkg_install python3-pip
-                    pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+                    # Ubuntu 24.04+ enforces PEP 668, blocking system-wide pip
+                    # without --break-system-packages. Try the flag (pip 23+),
+                    # fall back to plain install for older pip (e.g. some RHEL).
+                    CFN_URL=https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+                    pip3 install --break-system-packages "$CFN_URL" \
+                      || pip3 install "$CFN_URL"
                     CFN_BIN=/usr/local/bin
                   fi
 
@@ -543,6 +548,17 @@ Resources:
                   fi
                   systemctl enable --now amazon-ssm-agent 2>/dev/null || \
                     systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent 2>/dev/null || true
+
+                  # aws CLI: preinstalled on Amazon Linux. Elsewhere the package
+                  # name is unreliable (Ubuntu 24.04 has no 'awscli' candidate),
+                  # so use the official v2 bundle, which is repo-independent.
+                  # Best-effort; the volume/EIP steps below tolerate its absence.
+                  if ! command -v aws >/dev/null 2>&1; then
+                    pkg_install unzip curl || true
+                    curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip \
+                      && unzip -q /tmp/awscliv2.zip -d /tmp \
+                      && /tmp/aws/install || true
+                  fi
 
                   ## Extras that cfn-init's declarative 'packages' can't express ##
                   # Kernel headers must be pinned to the running kernel via uname,
