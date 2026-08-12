@@ -2,6 +2,25 @@
 
 A CloudFormation template that runs one or more bastion hosts on EC2 Spot instances. Each bastion sits in its own size-1 Auto Scaling group, so when Spot reclaims the instance the group launches a replacement automatically. The template is OS-agnostic (Amazon Linux 2023, Ubuntu, or RHEL), and access, a stable public IP, and a persistent data disk are each optional.
 
+## Contents
+
+- [What it deploys](#what-it-deploys)
+- [How it works](#how-it-works)
+  - [Picking the OS](#picking-the-os)
+  - [Booting across distros](#booting-across-distros)
+  - [Stable IP without a static instance](#stable-ip-without-a-static-instance)
+  - [Persistent disk and the AZ pin](#persistent-disk-and-the-az-pin)
+  - [Running several bastions from one stack](#running-several-bastions-from-one-stack)
+- [Parameters](#parameters)
+- [Outputs](#outputs)
+- [Deploy](#deploy)
+- [Access](#access)
+  - [1. Session Manager shell (IAM only)](#1-session-manager-shell-iam-only)
+  - [2. SSH over SSM (tunneled, still private)](#2-ssh-over-ssm-tunneled-still-private)
+  - [SSH with a public IP (no SSM)](#ssh-with-a-public-ip-no-ssm)
+  - [Both SSM paths need the agent to reach the SSM service](#both-ssm-paths-need-the-agent-to-reach-the-ssm-service)
+- [Things to know before scaling up](#things-to-know-before-scaling-up)
+
 ## What it deploys
 
 For a single deploy you get:
@@ -111,12 +130,46 @@ aws cloudformation deploy \
 
 ## Access
 
-Two paths, and they compose:
+Every bastion attaches the `AmazonSSMManagedInstanceCore` policy, so SSM works with no key pair, no open port, and no public IP. The instance's SSM agent holds an outbound connection to the SSM service and your session rides back down it, so nothing connects inbound. There are two ways to use it.
 
-- **SSH.** Set `Keypair` and reach the instance on its Elastic IP (or the subnet's auto-assigned IP if `AssignEIP=no`). SSH keepalive is set to roughly four hours idle.
-- **SSM Session Manager.** Always available through the attached `AmazonSSMManagedInstanceCore` policy. Needs no key, no open port, and no public IP. Run `aws ssm start-session --target <instance-id>`.
+### 1. Session Manager shell (IAM only)
 
-A locked-down bastion runs with `Keypair` blank and `AssignEIP=no`, reachable only through SSM.
+The simplest path. No key pair, no SSH, access gated entirely by IAM:
+
+```
+aws ssm start-session --target <instance-id>
+```
+
+This drops you into a shell as `ssm-user`. Deploy with `Keypair` blank and `AssignEIP=no` and this is the only way in, which is the most locked-down setup.
+
+### 2. SSH over SSM (tunneled, still private)
+
+Use this when you want real `ssh`, with `scp` and port forwarding, to an instance that has no public IP and no inbound port 22. SSM tunnels the SSH connection. sshd still authenticates you, so you need an SSH credential, either a `Keypair` set at launch or an ephemeral key pushed by EC2 Instance Connect. This differs from the shell above, which needs no key at all.
+
+Add this to your `~/.ssh/config`:
+
+```
+# SSH over Session Manager
+Host i-* mi-*
+    ProxyCommand sh -c "aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters 'portNumber=%p'"
+    User ec2-user
+```
+
+Then connect by instance id:
+
+```
+ssh i-0123456789abcdef0
+```
+
+Set `User` to match the AMI. Use `ec2-user` for Amazon Linux and RHEL, `ubuntu` for Ubuntu. On your side you need a recent AWS CLI, the Session Manager plugin installed locally, and IAM permission to start sessions. Full setup is in [Enable SSH connections through Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-getting-started-enable-ssh-connections.html).
+
+### SSH with a public IP (no SSM)
+
+Set `Keypair`, deploy with `AssignEIP=yes`, and SSH straight to the Elastic IP. Requires `SourceIP` to allow your address on port 22. SSH keepalive is set to roughly four hours idle.
+
+### Both SSM paths need the agent to reach the SSM service
+
+Because SSM depends on the agent's outbound connection, a private instance works fine as long as it has an egress path to the SSM endpoints. A private subnet with a NAT gateway is enough. A fully isolated subnet (no NAT, no internet gateway) needs three VPC interface endpoints, `ssm`, `ssmmessages`, and `ec2messages`, and then SSM works with zero internet exposure. A subnet with no egress and no endpoints is the one case where SSM cannot connect.
 
 ## Things to know before scaling up
 
