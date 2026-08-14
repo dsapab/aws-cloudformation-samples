@@ -1,7 +1,36 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: VPC setup with public and private schema.
+Description: >
+  VPC with public and (optionally) private subnets. NetworkMode selects one of
+  three layouts: PublicOnly, PublicPrivate (managed NAT gateway), or
+  PublicPrivateCustomRouting (a self-healing EC2 Spot gateway that routes all
+  private-subnet egress - a VPN client can be layered on top).
 
+#################################
+# Metadata and interface
+##
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network layout ..."
+        Parameters:
+          - NetworkMode
+          - ResourcesPrefixName
+      - Label:
+          default: "Flow logs (optional) ..."
+        Parameters:
+          - EnableFlowLogs
+          - TrafficType
+          - RetentionInDays
+      - Label:
+          default: "Custom routing gateway (NetworkMode=PublicPrivateCustomRouting) ..."
+        Parameters:
+          - GatewayInstanceType
+          - GatewayCapacityMode
 
+#################################
+# Parameters
+##
 Parameters:
   ResourcesPrefixName:
     Description: Prefix name for all the auto generated resources
@@ -44,20 +73,91 @@ Parameters:
     AllowedValues:
       - 'true'
       - 'false'
-  EnablePrivateSubnets:
-    Description: Enable private subnets and associated resources
+  NetworkMode:
+    Description: >
+      Network layout to deploy.
+      - PublicOnly: public subnets, IGW, public route table only.
+      - PublicPrivate: also private subnets behind a managed NAT gateway.
+      - PublicPrivateCustomRouting: private subnets behind a self-healing EC2
+        Spot gateway that re-points the private route at itself and NATs egress
+        (a VPN client can be layered on top). See the custom-gateway parameters.
     Type: String
-    Default: 'false'
+    Default: PublicOnly
     AllowedValues:
-      - 'true'
-      - 'false'
+      - PublicOnly
+      - PublicPrivate
+      - PublicPrivateCustomRouting
+
+  GatewayInstanceType:
+    Description: >
+      Instance type for the custom routing gateway. Used only when
+      NetworkMode=PublicPrivateCustomRouting. Also the first entry in the Auto
+      Scaling group's instance-type overrides (alongside a couple of small
+      alternates) so the Spot capacity strategy has choices.
+    Type: String
+    Default: t3.small
+
+  GatewayCapacityMode:
+    Description: >
+      Purchase model for the custom routing gateway. Used only when
+      NetworkMode=PublicPrivateCustomRouting.
+      - SpotLowestPrice: 100% Spot, cheapest AZ/type (most interruptions).
+      - SpotCapacityOptimized: 100% Spot, price-capacity-optimized (fewer
+        interruptions, better availability).
+      - OnDemand: no Spot; the single instance is On-Demand (best availability,
+        highest cost).
+    Type: String
+    Default: SpotLowestPrice
+    AllowedValues:
+      - SpotLowestPrice
+      - SpotCapacityOptimized
+      - OnDemand
 
 
+#################################
+# Conditions
+##
 Conditions:
   EnableFlowLogsCondition: !Equals [!Ref EnableFlowLogs, 'true']
-  EnablePrivateSubnetsCondition: !Equals [!Ref EnablePrivateSubnets, 'true']
 
+  # True for both private layouts (PublicPrivate and PublicPrivateCustomRouting);
+  # gates the private subnets, private route table, and their associations.
+  HasPrivateSubnets: !Not [!Equals [!Ref NetworkMode, PublicOnly]]
+
+  # True only for the managed NAT gateway layout.
+  UseNatGateway: !Equals [!Ref NetworkMode, PublicPrivate]
+
+  # True only for the custom EC2 Spot routing gateway layout.
+  UseCustomGateway: !Equals [!Ref NetworkMode, PublicPrivateCustomRouting]
+
+
+#################################
+# Mappings
+##
+Mappings:
+  # Turns GatewayCapacityMode into the two MixedInstancesPolicy fields the ASG
+  # needs. The ASG is size 1, so OnDemandPercentage 100 (base 0) yields a single
+  # On-Demand instance; the Spot modes yield 100% Spot with the chosen strategy.
+  # SpotStrategy keeps a valid value in OnDemand mode (it is simply not used).
+  CapacityModeMap:
+    SpotLowestPrice:
+      OnDemandPercentage: 0
+      SpotStrategy: lowest-price
+    SpotCapacityOptimized:
+      OnDemandPercentage: 0
+      SpotStrategy: price-capacity-optimized
+    OnDemand:
+      OnDemandPercentage: 100
+      SpotStrategy: lowest-price
+
+#################################
+# Resources
+##
 Resources:
+
+  ###
+  # VPC and subnets (public always; private in both PublicPrivate modes)
+  ##
   PubPrivateVPC:
     Type: 'AWS::EC2::VPC'
     Properties:
@@ -115,7 +215,7 @@ Resources:
 
   PrivateSubnet1:
     Type: 'AWS::EC2::Subnet'
-    Condition: EnablePrivateSubnetsCondition
+    Condition: HasPrivateSubnets
     Properties:
       VpcId:
         Ref: PubPrivateVPC
@@ -131,7 +231,7 @@ Resources:
 
   PrivateSubnet2:
     Type: 'AWS::EC2::Subnet'
-    Condition: EnablePrivateSubnetsCondition
+    Condition: HasPrivateSubnets
     Properties:
       VpcId:
         Ref: PubPrivateVPC
@@ -147,7 +247,7 @@ Resources:
 
   PrivateSubnet3:
     Type: 'AWS::EC2::Subnet'
-    Condition: EnablePrivateSubnetsCondition
+    Condition: HasPrivateSubnets
     Properties:
       VpcId:
         Ref: PubPrivateVPC
@@ -161,6 +261,9 @@ Resources:
         - Key: Name
           Value: !Sub ${ResourcesPrefixName}-private-subnet-C
 
+  ###
+  # Internet gateway and public routing
+  ##
   InternetGateway:
     Type: 'AWS::EC2::InternetGateway'
     Properties:
@@ -219,9 +322,14 @@ Resources:
       RouteTableId:
         Ref: PublicRouteTable
 
+  ###
+  # Private routing: managed NAT gateway (PublicPrivate) and the private route
+  # table. In PublicPrivateCustomRouting the default route is instead written by
+  # the custom gateway instance at boot (see the Custom routing gateway block).
+  ##
   NatGateway:
     Type: 'AWS::EC2::NatGateway'
-    Condition: EnablePrivateSubnetsCondition
+    Condition: UseNatGateway
     Properties:
       AllocationId:
         'Fn::GetAtt':
@@ -235,14 +343,14 @@ Resources:
 
   NatPublicIP:
     Type: 'AWS::EC2::EIP'
-    Condition: EnablePrivateSubnetsCondition
+    Condition: UseNatGateway
     DependsOn: PubPrivateVPC
     Properties:
       Domain: vpc
 
   PrivateRouteTable:
     Type: 'AWS::EC2::RouteTable'
-    Condition: EnablePrivateSubnetsCondition
+    Condition: HasPrivateSubnets
     Properties:
       VpcId:
         Ref: PubPrivateVPC
@@ -250,9 +358,12 @@ Resources:
         - Key: Name
           Value: !Sub ${ResourcesPrefixName}-PrivateRouteTable
 
+  # Managed NAT gateway layout only. In PublicPrivateCustomRouting there is no
+  # CloudFormation-managed default route: the gateway instance creates and
+  # re-points 0.0.0.0/0 to itself at boot (see CustomGwLaunchTemplate UserData).
   PrivateRoute:
     Type: 'AWS::EC2::Route'
-    Condition: EnablePrivateSubnetsCondition
+    Condition: UseNatGateway
     Properties:
       RouteTableId:
         Ref: PrivateRouteTable
@@ -262,7 +373,7 @@ Resources:
 
   PrivateSubnet1RouteTableAssociation:
     Type: 'AWS::EC2::SubnetRouteTableAssociation'
-    Condition: EnablePrivateSubnetsCondition
+    Condition: HasPrivateSubnets
     Properties:
       SubnetId:
         Ref: PrivateSubnet1
@@ -271,7 +382,7 @@ Resources:
 
   PrivateSubnet2RouteTableAssociation:
     Type: 'AWS::EC2::SubnetRouteTableAssociation'
-    Condition: EnablePrivateSubnetsCondition
+    Condition: HasPrivateSubnets
     Properties:
       SubnetId:
         Ref: PrivateSubnet2
@@ -280,13 +391,324 @@ Resources:
 
   PrivateSubnet3RouteTableAssociation:
     Type: 'AWS::EC2::SubnetRouteTableAssociation'
-    Condition: EnablePrivateSubnetsCondition
+    Condition: HasPrivateSubnets
     Properties:
       SubnetId:
         Ref: PrivateSubnet3
       RouteTableId:
         Ref: PrivateRouteTable
 
+  ###
+  # Custom routing gateway (NetworkMode=PublicPrivateCustomRouting)
+  #
+  # Replaces the managed NAT gateway with a size-1 Spot Auto Scaling group that
+  # self-heals on reclaim (the ec2-spot-bastion pattern, trimmed to Amazon Linux
+  # 2023, no EIP, no data volume). The instance sits in the PUBLIC subnets (it
+  # needs IGW egress), disables its own source/dest check, points the private
+  # route table's 0.0.0.0/0 at itself, and NATs private-subnet traffic. A VPN
+  # client can be layered on top later: upload its config to the S3 bucket this
+  # stack creates (CustomGwVpnBucket) and fill in the TODO block in UserData.
+  ##
+
+  # Private bucket for the VPN client files. Created empty; upload the config
+  # later. Deleted with the stack ONLY if empty (S3 will not delete a bucket
+  # that still has objects), so empty it first if you need to tear down.
+  CustomGwVpnBucket:
+    Type: 'AWS::S3::Bucket'
+    Condition: UseCustomGateway
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ResourcesPrefixName}-custom-gw-vpn
+
+  CustomGwSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Condition: UseCustomGateway
+    Properties:
+      GroupDescription: Custom routing gateway - allow all traffic from within the VPC
+      VpcId: !Ref PubPrivateVPC
+      # The gateway forwards private-subnet traffic, so it must accept it. Egress
+      # defaults to allow-all. No world-facing ingress; manage the box via SSM.
+      SecurityGroupIngress:
+        - IpProtocol: '-1'
+          CidrIp: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: !Sub ${ResourcesPrefixName}-custom-gw-sg
+
+  CustomGwInstanceRole:
+    Type: 'AWS::IAM::Role'
+    Condition: UseCustomGateway
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      # SSM Session Manager access (keyless), and the SSM agent's egress works
+      # once the gateway routes itself out via the public subnet.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: custom-gw
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Create/re-point the private default route to this instance. Scoped
+              # to the private route table this stack owns.
+              - Sid: ManageDefaultRoute
+                Effect: Allow
+                Action:
+                  - 'ec2:CreateRoute'
+                  - 'ec2:ReplaceRoute'
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:route-table/${PrivateRouteTable}'
+              # Disable THIS instance's source/dest check so it can forward.
+              # Scoped to instances tagged as this gateway. The launch template
+              # applies the Name tag at launch, so it is present by the time the
+              # boot script makes this call.
+              - Sid: DisableSourceDestCheck
+                Effect: Allow
+                Action: 'ec2:ModifyInstanceAttribute'
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/Name: !Sub '${ResourcesPrefixName}-custom-gw'
+              # Read route tables for the watchdog's route check. EC2 Describe*
+              # calls do not support resource-level scoping, so this must be '*'.
+              - Sid: DescribeRouteTables
+                Effect: Allow
+                Action: 'ec2:DescribeRouteTables'
+                Resource: '*'
+              # Watchdog marks this gateway's instance unhealthy so the ASG
+              # replaces a booted-but-black-holing gateway. Scoped to this ASG by
+              # its fixed name, built from the same param used to name the group.
+              # (Referencing the ASG resource here would be circular, since the
+              # ASG depends on this role through the instance profile.)
+              - Sid: WatchdogHealth
+                Effect: Allow
+                Action: 'autoscaling:SetInstanceHealth'
+                Resource: !Sub 'arn:${AWS::Partition}:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${ResourcesPrefixName}-custom-gw'
+              # Pull VPN client files from the bucket this stack creates. Scoped to
+              # that bucket and its objects only.
+              - Sid: VpnFiles
+                Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !GetAtt CustomGwVpnBucket.Arn
+                  - !Sub '${CustomGwVpnBucket.Arn}/*'
+
+  CustomGwInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Condition: UseCustomGateway
+    Properties:
+      Path: /
+      Roles:
+        - !Ref CustomGwInstanceRole
+
+  CustomGwLaunchTemplate:
+    Type: 'AWS::EC2::LaunchTemplate'
+    Condition: UseCustomGateway
+    Properties:
+      LaunchTemplateData:
+        # Latest region-appropriate Amazon Linux 2023 AMI, resolved at deploy time.
+        ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+        InstanceType: !Ref GatewayInstanceType
+        SecurityGroupIds:
+          - !Ref CustomGwSecurityGroup
+        IamInstanceProfile:
+          Name: !Ref CustomGwInstanceProfile
+        MetadataOptions:
+          HttpTokens: required
+        UserData:
+          Fn::Base64:
+            !Sub |
+              #!/bin/bash -xe
+
+              # Fail the stack fast (don't wait for the CreationPolicy timeout) if
+              # any command below errors.
+              trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackId} --resource CustomGwASG --region ${AWS::Region}' ERR
+
+              # --- Identity (IMDSv2) ---
+              TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+                        -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+              IID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+                        http://169.254.169.254/latest/meta-data/instance-id)
+
+              # --- Prerequisites ---
+              # Amazon Linux 2023 ships nftables, not the iptables command, so the
+              # MASQUERADE rule below needs the iptables package (nft-backed).
+              dnf install -y iptables
+
+              # --- Act as a router ---
+              # 1. Enable IPv4 forwarding (persisted so it survives reboots).
+              echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/99-custom-gw.conf
+              sysctl -p /etc/sysctl.d/99-custom-gw.conf
+
+              # 2. Disable this instance's source/dest check so it can forward
+              #    packets not addressed to itself.
+              aws ec2 modify-instance-attribute --region ${AWS::Region} \
+                --instance-id "$IID" --no-source-dest-check
+
+              # 3. Point the private route table's default route at this instance.
+              #    ReplaceRoute updates the (possibly blackholed) route left by a
+              #    previous instance; CreateRoute handles the very first boot.
+              aws ec2 replace-route --region ${AWS::Region} \
+                --route-table-id ${PrivateRouteTable} \
+                --destination-cidr-block 0.0.0.0/0 --instance-id "$IID" 2>/dev/null \
+              || aws ec2 create-route --region ${AWS::Region} \
+                --route-table-id ${PrivateRouteTable} \
+                --destination-cidr-block 0.0.0.0/0 --instance-id "$IID"
+
+              # 4. NAT (masquerade) private-subnet traffic out the primary
+              #    interface. This gives working egress immediately, before any
+              #    VPN is wired. Rules are re-applied on each boot (ephemeral box).
+              PRIMARY_IF=$(ip route show default | awk '{print $5; exit}')
+              iptables -t nat -A POSTROUTING -s 10.0.0.0/16 -o "$PRIMARY_IF" -j MASQUERADE
+
+              # --- VPN client files ---
+              # Pull whatever is in the stack-created bucket into /etc/vpn. The
+              # bucket starts empty (files are uploaded later), so this is a no-op
+              # until then. Best-effort so an empty bucket never blocks boot.
+              mkdir -p /etc/vpn
+              aws s3 cp --recursive "s3://${CustomGwVpnBucket}/" /etc/vpn/ || true
+
+              ############################################################
+              # TODO: VPN connect (left as a scaffold hook).
+              #   - Install the VPN client (e.g. `dnf install -y vpnc`).
+              #   - Connect the tunnel using the files in /etc/vpn.
+              #   - Re-point the MASQUERADE above from "$PRIMARY_IF" to tun0 so
+              #     private egress leaves via the VPN instead of the public subnet.
+              #   - Extend the watchdog probe below to also require the tunnel up
+              #     (`ip link show tun0`).
+              ############################################################
+
+              # --- Health watchdog ---
+              # A booted instance whose route or egress is broken would otherwise
+              # sit in service black-holing traffic. This timer marks the instance
+              # unhealthy so the ASG replaces it.
+              cat > /usr/local/sbin/gw-healthcheck.sh <<'GWHC'
+              #!/bin/bash
+              TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+                        -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+              IID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+                        http://169.254.169.254/latest/meta-data/instance-id)
+              OK=1
+              # The private default route must still target THIS instance.
+              TARGET=$(aws ec2 describe-route-tables --region ${AWS::Region} \
+                --route-table-ids ${PrivateRouteTable} \
+                --query "RouteTables[0].Routes[?DestinationCidrBlock=='0.0.0.0/0'].InstanceId | [0]" \
+                --output text 2>/dev/null)
+              [ "$TARGET" = "$IID" ] || OK=0
+              # General egress must work (once VPN is wired, also require tun0 up).
+              curl -s --max-time 5 https://checkip.amazonaws.com >/dev/null 2>&1 || OK=0
+              if [ "$OK" -ne 1 ]; then
+                aws autoscaling set-instance-health --region ${AWS::Region} \
+                  --instance-id "$IID" --health-status Unhealthy
+              fi
+              GWHC
+              chmod 0755 /usr/local/sbin/gw-healthcheck.sh
+
+              cat > /etc/systemd/system/gw-healthcheck.service <<'UNIT'
+              [Unit]
+              Description=Custom gateway route/egress health watchdog
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/local/sbin/gw-healthcheck.sh
+              UNIT
+
+              cat > /etc/systemd/system/gw-healthcheck.timer <<'UNIT'
+              [Unit]
+              Description=Run the custom gateway health watchdog periodically
+              [Timer]
+              OnBootSec=2min
+              OnUnitActiveSec=1min
+              [Install]
+              WantedBy=timers.target
+              UNIT
+
+              systemctl daemon-reload
+              systemctl enable --now gw-healthcheck.timer
+
+              # Signal success to the CreationPolicy.
+              /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackId} --resource CustomGwASG --region ${AWS::Region}
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${ResourcesPrefixName}-custom-gw
+
+  CustomGwASG:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Condition: UseCustomGateway
+    # Wait for the instance's cfn-signal (route re-point + NAT set up) before the
+    # stack reports CREATE_COMPLETE.
+    CreationPolicy:
+      AutoScalingCreationPolicy:
+        MinSuccessfulInstancesPercent: 100
+      ResourceSignal:
+        Count: 1
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: 1
+        MinInstancesInService: 0
+        MinSuccessfulInstancesPercent: 100
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+    Properties:
+      # Fixed name so the instance role's WatchdogHealth policy can scope
+      # SetInstanceHealth to this exact ASG without a circular reference.
+      AutoScalingGroupName: !Sub '${ResourcesPrefixName}-custom-gw'
+      # Size 1: exists for recovery and Spot placement, not for scaling.
+      MinSize: '1'
+      MaxSize: '1'
+      DesiredCapacity: '1'
+      # Span all three PUBLIC subnets so the instance can launch in whichever AZ
+      # has capacity (availability). It routes private traffic VPC-wide, so its
+      # AZ need not match the private subnets'.
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+        - !Ref PublicSubnet3
+      MixedInstancesPolicy:
+        # Purchase model is driven by GatewayCapacityMode via CapacityModeMap:
+        # SpotLowestPrice (default) / SpotCapacityOptimized / OnDemand.
+        InstancesDistribution:
+          OnDemandBaseCapacity: 0
+          OnDemandPercentageAboveBaseCapacity: !FindInMap [CapacityModeMap, !Ref GatewayCapacityMode, OnDemandPercentage]
+          SpotAllocationStrategy: !FindInMap [CapacityModeMap, !Ref GatewayCapacityMode, SpotStrategy]
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref CustomGwLaunchTemplate
+            Version: !GetAtt CustomGwLaunchTemplate.LatestVersionNumber
+          # A few small diversified types so the Spot strategy has choices.
+          Overrides:
+            - InstanceType: !Ref GatewayInstanceType
+            - InstanceType: t3a.small
+            - InstanceType: t2.small
+      Tags:
+        - Key: Name
+          Value: !Sub ${ResourcesPrefixName}-custom-gw
+          PropagateAtLaunch: true
+
+  ###
+  # VPC flow logs (optional, EnableFlowLogs=true; independent of NetworkMode)
+  ##
   LogGroup:
     Type: 'AWS::Logs::LogGroup'
     Condition: EnableFlowLogsCondition
@@ -339,6 +761,9 @@ Resources:
       TrafficType:
         Ref: TrafficType
 
+#################################
+# Outputs
+##
 Outputs:
 
   PubPrivateVPCID:
@@ -350,7 +775,7 @@ Outputs:
         'Fn::Sub': '${AWS::StackName}-VPCId'
 
   PrivateSubnet1ID:
-    Condition: EnablePrivateSubnetsCondition
+    Condition: HasPrivateSubnets
     Description: Private Subnet A ID
     Value:
       Ref: PrivateSubnet1
@@ -359,7 +784,7 @@ Outputs:
         'Fn::Sub': '${AWS::StackName}-privateSubnetID1'
 
   PrivateSubnet2ID:
-    Condition: EnablePrivateSubnetsCondition
+    Condition: HasPrivateSubnets
     Description: Private Subnet B ID
     Value:
       Ref: PrivateSubnet2
@@ -368,7 +793,7 @@ Outputs:
         'Fn::Sub': '${AWS::StackName}-privateSubnetID2'
 
   PrivateSubnet3ID:
-    Condition: EnablePrivateSubnetsCondition
+    Condition: HasPrivateSubnets
     Description: Private Subnet B ID
     Value:
       Ref: PrivateSubnet3
@@ -409,3 +834,31 @@ Outputs:
       'Fn::GetAtt':
         - LogGroup
         - Arn
+
+  CustomGatewayASGName:
+    Condition: UseCustomGateway
+    Description: Auto Scaling group name of the custom routing gateway.
+    Value:
+      Ref: CustomGwASG
+
+  CustomGatewayVpnBucket:
+    Condition: UseCustomGateway
+    Description: >-
+      Bucket the gateway reads VPN client files from. Upload your config here,
+      then wire the TODO block in the gateway UserData.
+    Value:
+      Ref: CustomGwVpnBucket
+    Export:
+      Name:
+        'Fn::Sub': '${AWS::StackName}-customGwVpnBucket'
+
+  PrivateRouteTableId:
+    Condition: UseCustomGateway
+    Description: >-
+      Private route table id. Its 0.0.0.0/0 route is managed by the custom
+      gateway instance at boot; handy for confirming the route target.
+    Value:
+      Ref: PrivateRouteTable
+    Export:
+      Name:
+        'Fn::Sub': '${AWS::StackName}-privateRouteTableId'
