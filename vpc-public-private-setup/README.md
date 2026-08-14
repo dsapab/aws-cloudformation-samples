@@ -2,6 +2,8 @@
 
 A CloudFormation template for a VPC with three public subnets across three Availability Zones and, optionally, three private subnets. One parameter, `NetworkMode`, picks how private egress works. Private subnets can exit through a managed NAT gateway or through a self-healing EC2 Spot instance that you can turn into a VPN router.
 
+The template is generated from a TypeScript CDK app under [`cdk/`](cdk/). See [Build (CDK)](#build-cdk).
+
 ## Contents
 
 - [Network modes](#network-modes)
@@ -13,6 +15,7 @@ A CloudFormation template for a VPC with three public subnets across three Avail
 - [Parameters](#parameters)
 - [Outputs](#outputs)
 - [Deploy](#deploy)
+- [Build (CDK)](#build-cdk)
 - [Things to know](#things-to-know)
 - [Things to do and fix](#things-to-do-and-fix)
 
@@ -138,6 +141,25 @@ aws ec2 describe-route-tables --route-table-ids <PrivateRouteTableId> \
 
 The `InstanceId` field should hold the running gateway. Reach the instance itself through SSM Session Manager, since it carries `AmazonSSMManagedInstanceCore` and has no open inbound ports.
 
+## Build (CDK)
+
+The template is generated from a TypeScript CDK app under [`cdk/`](cdk/). `vpc-public-private-setup.yaml` is the synth output and the deployable artifact. `vpc-public-private-setup-original.yaml` is the earlier hand-written version, kept for comparison.
+
+The CDK app is a one-to-one, L1-only re-authoring. It keeps `NetworkMode` and the Conditions, so one synthesized template still selects the layout at deploy time, exactly like the original, and preserves every logical ID and export name. The boot script lives as a real file at [`cdk/scripts/gw-bootstrap.sh`](cdk/scripts/gw-bootstrap.sh) and is inlined into the launch-template UserData at synth. It is an `Fn::Sub` template, so `${AWS::Region}`, `${PrivateRouteTable}`, and the other placeholders resolve at deploy time, which is why shellcheck flags those lines.
+
+A Makefile drives the build:
+
+```bash
+cd cdk
+make synth      # write ../vpc-public-private-setup.yaml from the CDK app
+make deploy     # deploy with cdk deploy (pass CDK_ARGS="--parameters NetworkMode=...")
+make compare    # structural diff of the generated template against the -original reference
+make prechecks  # verify node, npm, and the AWS CLI are present
+make clean      # remove node_modules and cdk.out
+```
+
+`make synth` and `make deploy` install dependencies first. The stack synthesizes with `CliCredentialsStackSynthesizer`, so the output carries no CDK bootstrap parameters and deploys with either `cdk deploy` or the plain `aws cloudformation deploy` commands above. After editing the CDK source, run `make synth` and commit the regenerated YAML.
+
 ## Things to know
 
 - **The default route is instance-managed in custom mode.** CloudFormation does not own the `0.0.0.0/0` route there. The instance writes it at boot. Do not add a static route to the private table in that mode.
@@ -170,14 +192,5 @@ A security group or NACL cannot fix this, because every forwarded packet leaves 
 - **No Elastic IP.** The public IP changes on every replacement. If your VPN peer allowlists by source IP, each Spot reclaim breaks the tunnel until you update the peer. Associate an EIP at boot, or front the gateway with a stable address, when the peer filters by IP.
 - **Watchdog thrash when the peer is down.** A tunnel check that fails because the remote end is unreachable marks every fresh instance unhealthy, so the group replaces it in a loop that fixes nothing. Separate "my route or egress is broken" from "the peer is down" before calling `set-instance-health`.
 - **The kill switch covers forwarded traffic only.** Anything running on the gateway still reaches the internet through eth0 for SSM, S3, and CloudFormation. If a compromised gateway is in your threat model, restrict the OUTPUT chain too, while leaving SSM, S3, and the CloudFormation endpoint reachable.
-
-### Move authoring to CDK
-
-Planned, in progress on the `dev` branch. Re-author this template as a CDK app while keeping it a single, unified, parameter-driven template. `NetworkMode` and the Conditions stay, so one synthesized template still handles all three modes at deploy time.
-
-- Use L1 constructs (`CfnVpc`, `CfnSubnet`, `CfnLaunchTemplate`, and the rest) mapped one-to-one to today's resources. No L2 constructs, since `ec2.Vpc` would impose its own subnet and routing layout.
-- Keep `CfnParameter`, `CfnCondition`, and `CfnMapping` so the deploy-time mode switch survives into the synthesized template.
-- Override logical IDs to match the current names, so the Output export names stay stable and the synth output is a drop-in for the deployed stack.
-- Move the boot script to `scripts/gw-bootstrap.sh` and read it at synth time with `readFileSync`, passing `PrivateRouteTable` and the bucket ref through the `Fn.sub` variables map. The script inlines as a literal, so the template stays self-contained.
-- Collapse the six subnets and their route-table associations into a loop.
-- Avoid CDK assets and suppress the bootstrap metadata (`DefaultStackSynthesizer` with `generateBootstrapVersionRule: false`), so a GitHub Actions workflow can run `cdk synth` and publish a template that deploys with plain `aws cloudformation deploy`.
+- **No private SSM path.** Session Manager to a private-subnet instance currently rides the gateway's internet egress, so a down gateway also means no SSM access. Add interface VPC endpoints for `ssm`, `ssmmessages`, and `ec2messages` (with a security group allowing 443 from the VPC CIDR) so private instances stay reachable over SSM without any internet path.
+- **A GitHub Actions workflow to run `cdk synth`.** The build is Makefile-driven locally (see [Build (CDK)](#build-cdk)). CI to regenerate and publish the template on push is not wired yet.

@@ -1,30 +1,43 @@
-Description: "VPC with public and (optionally) private subnets. NetworkMode selects one of three layouts: PublicOnly, PublicPrivate (managed NAT gateway), or PublicPrivateCustomRouting (a self-healing EC2 Spot gateway that routes all private-subnet egress - a VPN client can be layered on top)."
-AWSTemplateFormatVersion: "2010-09-09"
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  VPC with public and (optionally) private subnets. NetworkMode selects one of
+  three layouts: PublicOnly, PublicPrivate (managed NAT gateway), or
+  PublicPrivateCustomRouting (a self-healing EC2 Spot gateway that routes all
+  private-subnet egress - a VPN client can be layered on top).
+
+#################################
+# Metadata and interface
+##
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label:
-          default: Network layout ...
+          default: "Network layout ..."
         Parameters:
           - NetworkMode
           - ResourcesPrefixName
       - Label:
-          default: Flow logs (optional) ...
+          default: "Flow logs (optional) ..."
         Parameters:
           - EnableFlowLogs
           - TrafficType
           - RetentionInDays
       - Label:
-          default: Custom routing gateway (NetworkMode=PublicPrivateCustomRouting) ...
+          default: "Custom routing gateway (NetworkMode=PublicPrivateCustomRouting) ..."
         Parameters:
           - GatewayInstanceType
           - GatewayCapacityMode
+
+#################################
+# Parameters
+##
 Parameters:
   ResourcesPrefixName:
+    Description: Prefix name for all the auto generated resources
     Type: String
     Default: auto-networking
-    Description: Prefix name for all the auto generated resources
   RetentionInDays:
+    Description: Specifies the number of days you want to retain log events.
     Type: Number
     Default: 14
     AllowedValues:
@@ -45,52 +58,47 @@ Parameters:
       - 731
       - 1827
       - 3653
-    Description: Specifies the number of days you want to retain log events.
   TrafficType:
+    Description: The type of traffic to log.
     Type: String
     Default: REJECT
     AllowedValues:
       - ACCEPT
       - REJECT
       - ALL
-    Description: The type of traffic to log.
   EnableFlowLogs:
-    Type: String
-    Default: "false"
-    AllowedValues:
-      - "true"
-      - "false"
     Description: Enable VPC Flow Logs
-  NetworkMode:
     Type: String
-    Default: PublicOnly
+    Default: 'false'
     AllowedValues:
-      - PublicOnly
-      - PublicPrivate
-      - PublicPrivateCustomRouting
-    Description: |-
+      - 'true'
+      - 'false'
+  NetworkMode:
+    Description: >
       Network layout to deploy.
       - PublicOnly: public subnets, IGW, public route table only.
       - PublicPrivate: also private subnets behind a managed NAT gateway.
       - PublicPrivateCustomRouting: private subnets behind a self-healing EC2
         Spot gateway that re-points the private route at itself and NATs egress
         (a VPN client can be layered on top). See the custom-gateway parameters.
-  GatewayInstanceType:
     Type: String
-    Default: t3.small
-    Description: |-
+    Default: PublicOnly
+    AllowedValues:
+      - PublicOnly
+      - PublicPrivate
+      - PublicPrivateCustomRouting
+
+  GatewayInstanceType:
+    Description: >
       Instance type for the custom routing gateway. Used only when
       NetworkMode=PublicPrivateCustomRouting. Also the first entry in the Auto
       Scaling group's instance-type overrides (alongside a couple of small
       alternates) so the Spot capacity strategy has choices.
-  GatewayCapacityMode:
     Type: String
-    Default: SpotLowestPrice
-    AllowedValues:
-      - SpotLowestPrice
-      - SpotCapacityOptimized
-      - OnDemand
-    Description: |-
+    Default: t3.small
+
+  GatewayCapacityMode:
+    Description: >
       Purchase model for the custom routing gateway. Used only when
       NetworkMode=PublicPrivateCustomRouting.
       - SpotLowestPrice: 100% Spot, cheapest AZ/type (most interruptions).
@@ -98,25 +106,39 @@ Parameters:
         interruptions, better availability).
       - OnDemand: no Spot; the single instance is On-Demand (best availability,
         highest cost).
+    Type: String
+    Default: SpotLowestPrice
+    AllowedValues:
+      - SpotLowestPrice
+      - SpotCapacityOptimized
+      - OnDemand
+
+
+#################################
+# Conditions
+##
 Conditions:
-  EnableFlowLogsCondition:
-    Fn::Equals:
-      - Ref: EnableFlowLogs
-      - "true"
-  HasPrivateSubnets:
-    Fn::Not:
-      - Fn::Equals:
-          - Ref: NetworkMode
-          - PublicOnly
-  UseNatGateway:
-    Fn::Equals:
-      - Ref: NetworkMode
-      - PublicPrivate
-  UseCustomGateway:
-    Fn::Equals:
-      - Ref: NetworkMode
-      - PublicPrivateCustomRouting
+  EnableFlowLogsCondition: !Equals [!Ref EnableFlowLogs, 'true']
+
+  # True for both private layouts (PublicPrivate and PublicPrivateCustomRouting);
+  # gates the private subnets, private route table, and their associations.
+  HasPrivateSubnets: !Not [!Equals [!Ref NetworkMode, PublicOnly]]
+
+  # True only for the managed NAT gateway layout.
+  UseNatGateway: !Equals [!Ref NetworkMode, PublicPrivate]
+
+  # True only for the custom EC2 Spot routing gateway layout.
+  UseCustomGateway: !Equals [!Ref NetworkMode, PublicPrivateCustomRouting]
+
+
+#################################
+# Mappings
+##
 Mappings:
+  # Turns GatewayCapacityMode into the two MixedInstancesPolicy fields the ASG
+  # needs. The ASG is size 1, so OnDemandPercentage 100 (base 0) yields a single
+  # On-Demand instance; the Spot modes yield 100% Spot with the chosen strategy.
+  # SpotStrategy keeps a valid value in OnDemand mode (it is simply not used).
   CapacityModeMap:
     SpotLowestPrice:
       OnDemandPercentage: 0
@@ -127,230 +149,273 @@ Mappings:
     OnDemand:
       OnDemandPercentage: 100
       SpotStrategy: lowest-price
+
+#################################
+# Resources
+##
 Resources:
+
+  ###
+  # VPC and subnets (public always; private in both PublicPrivate modes)
+  ##
   PubPrivateVPC:
-    Type: AWS::EC2::VPC
+    Type: 'AWS::EC2::VPC'
     Properties:
       CidrBlock: 10.0.0.0/16
       EnableDnsHostnames: true
       EnableDnsSupport: true
       Tags:
         - Key: Name
-          Value:
-            Fn::Sub: ${ResourcesPrefixName}-vpc
+          Value: !Sub ${ResourcesPrefixName}-vpc
+
   PublicSubnet1:
-    Type: AWS::EC2::Subnet
+    Type: 'AWS::EC2::Subnet'
     Properties:
+      VpcId:
+        Ref: PubPrivateVPC
       AvailabilityZone:
-        Fn::Select:
+        'Fn::Select':
           - 0
-          - Fn::GetAZs: ""
+          - 'Fn::GetAZs': ''
       CidrBlock: 10.0.1.0/24
       MapPublicIpOnLaunch: true
       Tags:
         - Key: Name
-          Value:
-            Fn::Sub: ${ResourcesPrefixName}-public-subnet-A
-      VpcId:
-        Ref: PubPrivateVPC
+          Value: !Sub ${ResourcesPrefixName}-public-subnet-A
+
   PublicSubnet2:
-    Type: AWS::EC2::Subnet
+    Type: 'AWS::EC2::Subnet'
     Properties:
       AvailabilityZone:
-        Fn::Select:
+        'Fn::Select':
           - 1
-          - Fn::GetAZs: ""
+          - 'Fn::GetAZs': ''
+      VpcId:
+        Ref: PubPrivateVPC
       CidrBlock: 10.0.2.0/24
       MapPublicIpOnLaunch: true
       Tags:
         - Key: Name
-          Value:
-            Fn::Sub: ${ResourcesPrefixName}-public-subnet-B
-      VpcId:
-        Ref: PubPrivateVPC
+          Value: !Sub ${ResourcesPrefixName}-public-subnet-B
+
   PublicSubnet3:
-    Type: AWS::EC2::Subnet
+    Type: 'AWS::EC2::Subnet'
     Properties:
       AvailabilityZone:
-        Fn::Select:
+        'Fn::Select':
           - 2
-          - Fn::GetAZs: ""
+          - 'Fn::GetAZs': ''
+      VpcId:
+        Ref: PubPrivateVPC
       CidrBlock: 10.0.3.0/24
       MapPublicIpOnLaunch: true
       Tags:
         - Key: Name
-          Value:
-            Fn::Sub: ${ResourcesPrefixName}-public-subnet-C
+          Value: !Sub ${ResourcesPrefixName}-public-subnet-C
+
+  PrivateSubnet1:
+    Type: 'AWS::EC2::Subnet'
+    Condition: HasPrivateSubnets
+    Properties:
       VpcId:
         Ref: PubPrivateVPC
-  PrivateSubnet1:
-    Type: AWS::EC2::Subnet
-    Properties:
       AvailabilityZone:
-        Fn::Select:
+        'Fn::Select':
           - 0
-          - Fn::GetAZs: ""
+          - 'Fn::GetAZs': ''
       CidrBlock: 10.0.4.0/24
       MapPublicIpOnLaunch: false
       Tags:
         - Key: Name
-          Value:
-            Fn::Sub: ${ResourcesPrefixName}-private-subnet-A
+          Value: !Sub ${ResourcesPrefixName}-private-subnet-A
+
+  PrivateSubnet2:
+    Type: 'AWS::EC2::Subnet'
+    Condition: HasPrivateSubnets
+    Properties:
       VpcId:
         Ref: PubPrivateVPC
-    Condition: HasPrivateSubnets
-  PrivateSubnet2:
-    Type: AWS::EC2::Subnet
-    Properties:
       AvailabilityZone:
-        Fn::Select:
+        'Fn::Select':
           - 1
-          - Fn::GetAZs: ""
+          - 'Fn::GetAZs': ''
       CidrBlock: 10.0.5.0/24
       MapPublicIpOnLaunch: false
       Tags:
         - Key: Name
-          Value:
-            Fn::Sub: ${ResourcesPrefixName}-private-subnet-B
+          Value: !Sub ${ResourcesPrefixName}-private-subnet-B
+
+  PrivateSubnet3:
+    Type: 'AWS::EC2::Subnet'
+    Condition: HasPrivateSubnets
+    Properties:
       VpcId:
         Ref: PubPrivateVPC
-    Condition: HasPrivateSubnets
-  PrivateSubnet3:
-    Type: AWS::EC2::Subnet
-    Properties:
       AvailabilityZone:
-        Fn::Select:
+        'Fn::Select':
           - 2
-          - Fn::GetAZs: ""
+          - 'Fn::GetAZs': ''
       CidrBlock: 10.0.6.0/24
       MapPublicIpOnLaunch: false
       Tags:
         - Key: Name
-          Value:
-            Fn::Sub: ${ResourcesPrefixName}-private-subnet-C
-      VpcId:
-        Ref: PubPrivateVPC
-    Condition: HasPrivateSubnets
+          Value: !Sub ${ResourcesPrefixName}-private-subnet-C
+
+  ###
+  # Internet gateway and public routing
+  ##
   InternetGateway:
-    Type: AWS::EC2::InternetGateway
+    Type: 'AWS::EC2::InternetGateway'
     Properties:
       Tags:
         - Key: Name
-          Value:
-            Fn::Sub: ${ResourcesPrefixName}-igw
+          Value: !Sub ${ResourcesPrefixName}-igw
+
   GatewayToInternet:
-    Type: AWS::EC2::VPCGatewayAttachment
+    Type: 'AWS::EC2::VPCGatewayAttachment'
     Properties:
+      VpcId:
+        Ref: PubPrivateVPC
       InternetGatewayId:
         Ref: InternetGateway
+
+  PublicRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
       VpcId:
         Ref: PubPrivateVPC
-  PublicRouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
       Tags:
         - Key: Name
-          Value:
-            Fn::Sub: ${ResourcesPrefixName}-PublicRouteTable
-      VpcId:
-        Ref: PubPrivateVPC
+          Value: !Sub ${ResourcesPrefixName}-PublicRouteTable
+
   PublicRoute:
-    Type: AWS::EC2::Route
+    Type: 'AWS::EC2::Route'
+    DependsOn: GatewayToInternet
     Properties:
+      RouteTableId:
+        Ref: PublicRouteTable
       DestinationCidrBlock: 0.0.0.0/0
       GatewayId:
         Ref: InternetGateway
-      RouteTableId:
-        Ref: PublicRouteTable
-    DependsOn:
-      - GatewayToInternet
+
   PublicSubnet1RouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
     Properties:
-      RouteTableId:
-        Ref: PublicRouteTable
       SubnetId:
         Ref: PublicSubnet1
-  PublicSubnet2RouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
       RouteTableId:
         Ref: PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
       SubnetId:
         Ref: PublicSubnet2
-  PublicSubnet3RouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
       RouteTableId:
         Ref: PublicRouteTable
+
+  PublicSubnet3RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
       SubnetId:
         Ref: PublicSubnet3
-  NatPublicIP:
-    Type: AWS::EC2::EIP
-    Properties:
-      Domain: vpc
-    DependsOn:
-      - PubPrivateVPC
-    Condition: UseNatGateway
+      RouteTableId:
+        Ref: PublicRouteTable
+
+  ###
+  # Private routing: managed NAT gateway (PublicPrivate) and the private route
+  # table. In PublicPrivateCustomRouting the default route is instead written by
+  # the custom gateway instance at boot (see the Custom routing gateway block).
+  ##
   NatGateway:
-    Type: AWS::EC2::NatGateway
+    Type: 'AWS::EC2::NatGateway'
+    Condition: UseNatGateway
     Properties:
       AllocationId:
-        Fn::GetAtt:
+        'Fn::GetAtt':
           - NatPublicIP
           - AllocationId
       SubnetId:
         Ref: PublicSubnet1
       Tags:
         - Key: Name
-          Value:
-            Fn::Sub: ${ResourcesPrefixName}-NatGateway
+          Value: !Sub ${ResourcesPrefixName}-NatGateway
+
+  NatPublicIP:
+    Type: 'AWS::EC2::EIP'
     Condition: UseNatGateway
-  PrivateRouteTable:
-    Type: AWS::EC2::RouteTable
+    DependsOn: PubPrivateVPC
     Properties:
-      Tags:
-        - Key: Name
-          Value:
-            Fn::Sub: ${ResourcesPrefixName}-PrivateRouteTable
+      Domain: vpc
+
+  PrivateRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Condition: HasPrivateSubnets
+    Properties:
       VpcId:
         Ref: PubPrivateVPC
-    Condition: HasPrivateSubnets
+      Tags:
+        - Key: Name
+          Value: !Sub ${ResourcesPrefixName}-PrivateRouteTable
+
+  # Managed NAT gateway layout only. In PublicPrivateCustomRouting there is no
+  # CloudFormation-managed default route: the gateway instance creates and
+  # re-points 0.0.0.0/0 to itself at boot (see CustomGwLaunchTemplate UserData).
   PrivateRoute:
-    Type: AWS::EC2::Route
+    Type: 'AWS::EC2::Route'
+    Condition: UseNatGateway
     Properties:
+      RouteTableId:
+        Ref: PrivateRouteTable
       DestinationCidrBlock: 0.0.0.0/0
       NatGatewayId:
         Ref: NatGateway
-      RouteTableId:
-        Ref: PrivateRouteTable
-    Condition: UseNatGateway
+
   PrivateSubnet1RouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: HasPrivateSubnets
     Properties:
-      RouteTableId:
-        Ref: PrivateRouteTable
       SubnetId:
         Ref: PrivateSubnet1
-    Condition: HasPrivateSubnets
-  PrivateSubnet2RouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
       RouteTableId:
         Ref: PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: HasPrivateSubnets
+    Properties:
       SubnetId:
         Ref: PrivateSubnet2
-    Condition: HasPrivateSubnets
-  PrivateSubnet3RouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
       RouteTableId:
         Ref: PrivateRouteTable
+
+  PrivateSubnet3RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: HasPrivateSubnets
+    Properties:
       SubnetId:
         Ref: PrivateSubnet3
-    Condition: HasPrivateSubnets
+      RouteTableId:
+        Ref: PrivateRouteTable
+
+  ###
+  # Custom routing gateway (NetworkMode=PublicPrivateCustomRouting)
+  #
+  # Replaces the managed NAT gateway with a size-1 Spot Auto Scaling group that
+  # self-heals on reclaim (the ec2-spot-bastion pattern, trimmed to Amazon Linux
+  # 2023, no EIP, no data volume). The instance sits in the PUBLIC subnets (it
+  # needs IGW egress), disables its own source/dest check, points the private
+  # route table's 0.0.0.0/0 at itself, and NATs private-subnet traffic. A VPN
+  # client can be layered on top later: upload its config to the S3 bucket this
+  # stack creates (CustomGwVpnBucket) and fill in the TODO block in UserData.
+  ##
+
+  # Private bucket for the VPN client files. Created empty; upload the config
+  # later. Deleted with the stack ONLY if empty (S3 will not delete a bucket
+  # that still has objects), so empty it first if you need to tear down.
   CustomGwVpnBucket:
-    Type: AWS::S3::Bucket
+    Type: 'AWS::S3::Bucket'
+    Condition: UseCustomGateway
     Properties:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
@@ -363,108 +428,115 @@ Resources:
         RestrictPublicBuckets: true
       Tags:
         - Key: Name
-          Value:
-            Fn::Sub: ${ResourcesPrefixName}-custom-gw-vpn
-    Condition: UseCustomGateway
+          Value: !Sub ${ResourcesPrefixName}-custom-gw-vpn
+
   CustomGwSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
+    Type: 'AWS::EC2::SecurityGroup'
+    Condition: UseCustomGateway
     Properties:
       GroupDescription: Custom routing gateway - allow all traffic from within the VPC
+      VpcId: !Ref PubPrivateVPC
+      # The gateway forwards private-subnet traffic, so it must accept it. Egress
+      # defaults to allow-all. No world-facing ingress; manage the box via SSM.
       SecurityGroupIngress:
-        - CidrIp: 10.0.0.0/16
-          IpProtocol: "-1"
+        - IpProtocol: '-1'
+          CidrIp: 10.0.0.0/16
       Tags:
         - Key: Name
-          Value:
-            Fn::Sub: ${ResourcesPrefixName}-custom-gw-sg
-      VpcId:
-        Ref: PubPrivateVPC
-    Condition: UseCustomGateway
+          Value: !Sub ${ResourcesPrefixName}-custom-gw-sg
+
   CustomGwInstanceRole:
-    Type: AWS::IAM::Role
+    Type: 'AWS::IAM::Role'
+    Condition: UseCustomGateway
     Properties:
       AssumeRolePolicyDocument:
-        Version: "2012-10-17"
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
               Service:
                 - ec2.amazonaws.com
-            Action: sts:AssumeRole
+            Action: 'sts:AssumeRole'
+      Path: /
+      # SSM Session Manager access (keyless), and the SSM agent's egress works
+      # once the gateway routes itself out via the public subnet.
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
-      Path: /
       Policies:
-        - PolicyDocument:
-            Version: "2012-10-17"
+        - PolicyName: custom-gw
+          PolicyDocument:
+            Version: '2012-10-17'
             Statement:
+              # Create/re-point the private default route to this instance. Scoped
+              # to the private route table this stack owns.
               - Sid: ManageDefaultRoute
                 Effect: Allow
                 Action:
-                  - ec2:CreateRoute
-                  - ec2:ReplaceRoute
-                Resource:
-                  Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:route-table/${PrivateRouteTable}
+                  - 'ec2:CreateRoute'
+                  - 'ec2:ReplaceRoute'
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:route-table/${PrivateRouteTable}'
+              # Disable THIS instance's source/dest check so it can forward.
+              # Scoped to instances tagged as this gateway. The launch template
+              # applies the Name tag at launch, so it is present by the time the
+              # boot script makes this call.
               - Sid: DisableSourceDestCheck
                 Effect: Allow
-                Action: ec2:ModifyInstanceAttribute
-                Resource:
-                  Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Action: 'ec2:ModifyInstanceAttribute'
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
                 Condition:
                   StringEquals:
-                    aws:ResourceTag/Name:
-                      Fn::Sub: ${ResourcesPrefixName}-custom-gw
+                    aws:ResourceTag/Name: !Sub '${ResourcesPrefixName}-custom-gw'
+              # Read route tables for the watchdog's route check. EC2 Describe*
+              # calls do not support resource-level scoping, so this must be '*'.
               - Sid: DescribeRouteTables
                 Effect: Allow
-                Action: ec2:DescribeRouteTables
-                Resource: "*"
+                Action: 'ec2:DescribeRouteTables'
+                Resource: '*'
+              # Watchdog marks this gateway's instance unhealthy so the ASG
+              # replaces a booted-but-black-holing gateway. Scoped to this ASG by
+              # its fixed name, built from the same param used to name the group.
+              # (Referencing the ASG resource here would be circular, since the
+              # ASG depends on this role through the instance profile.)
               - Sid: WatchdogHealth
                 Effect: Allow
-                Action: autoscaling:SetInstanceHealth
-                Resource:
-                  Fn::Sub: arn:${AWS::Partition}:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${ResourcesPrefixName}-custom-gw
+                Action: 'autoscaling:SetInstanceHealth'
+                Resource: !Sub 'arn:${AWS::Partition}:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${ResourcesPrefixName}-custom-gw'
+              # Pull VPN client files from the bucket this stack creates. Scoped to
+              # that bucket and its objects only.
               - Sid: VpnFiles
                 Effect: Allow
                 Action:
-                  - s3:GetObject
-                  - s3:ListBucket
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
                 Resource:
-                  - Fn::GetAtt:
-                      - CustomGwVpnBucket
-                      - Arn
-                  - Fn::Sub: ${CustomGwVpnBucket.Arn}/*
-          PolicyName: custom-gw
-    Condition: UseCustomGateway
+                  - !GetAtt CustomGwVpnBucket.Arn
+                  - !Sub '${CustomGwVpnBucket.Arn}/*'
+
   CustomGwInstanceProfile:
-    Type: AWS::IAM::InstanceProfile
+    Type: 'AWS::IAM::InstanceProfile'
+    Condition: UseCustomGateway
     Properties:
       Path: /
       Roles:
-        - Ref: CustomGwInstanceRole
-    Condition: UseCustomGateway
+        - !Ref CustomGwInstanceRole
+
   CustomGwLaunchTemplate:
-    Type: AWS::EC2::LaunchTemplate
+    Type: 'AWS::EC2::LaunchTemplate'
+    Condition: UseCustomGateway
     Properties:
       LaunchTemplateData:
+        # Latest region-appropriate Amazon Linux 2023 AMI, resolved at deploy time.
+        ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+        InstanceType: !Ref GatewayInstanceType
+        SecurityGroupIds:
+          - !Ref CustomGwSecurityGroup
         IamInstanceProfile:
-          Name:
-            Ref: CustomGwInstanceProfile
-        ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
-        InstanceType:
-          Ref: GatewayInstanceType
+          Name: !Ref CustomGwInstanceProfile
         MetadataOptions:
           HttpTokens: required
-        SecurityGroupIds:
-          - Ref: CustomGwSecurityGroup
-        TagSpecifications:
-          - ResourceType: instance
-            Tags:
-              - Key: Name
-                Value:
-                  Fn::Sub: ${ResourcesPrefixName}-custom-gw
         UserData:
           Fn::Base64:
-            Fn::Sub: |
+            !Sub |
               #!/bin/bash -xe
 
               # Fail the stack fast (don't wait for the CreationPolicy timeout) if
@@ -574,50 +646,17 @@ Resources:
 
               # Signal success to the CreationPolicy.
               /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackId} --resource CustomGwASG --region ${AWS::Region}
-    Condition: UseCustomGateway
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${ResourcesPrefixName}-custom-gw
+
   CustomGwASG:
-    Type: AWS::AutoScaling::AutoScalingGroup
-    Properties:
-      AutoScalingGroupName:
-        Fn::Sub: ${ResourcesPrefixName}-custom-gw
-      DesiredCapacity: "1"
-      MaxSize: "1"
-      MinSize: "1"
-      MixedInstancesPolicy:
-        InstancesDistribution:
-          OnDemandBaseCapacity: 0
-          OnDemandPercentageAboveBaseCapacity:
-            Fn::FindInMap:
-              - CapacityModeMap
-              - Ref: GatewayCapacityMode
-              - OnDemandPercentage
-          SpotAllocationStrategy:
-            Fn::FindInMap:
-              - CapacityModeMap
-              - Ref: GatewayCapacityMode
-              - SpotStrategy
-        LaunchTemplate:
-          LaunchTemplateSpecification:
-            LaunchTemplateId:
-              Ref: CustomGwLaunchTemplate
-            Version:
-              Fn::GetAtt:
-                - CustomGwLaunchTemplate
-                - LatestVersionNumber
-          Overrides:
-            - InstanceType:
-                Ref: GatewayInstanceType
-            - InstanceType: t3a.small
-            - InstanceType: t2.small
-      Tags:
-        - Key: Name
-          PropagateAtLaunch: true
-          Value:
-            Fn::Sub: ${ResourcesPrefixName}-custom-gw
-      VPCZoneIdentifier:
-        - Ref: PublicSubnet1
-        - Ref: PublicSubnet2
-        - Ref: PublicSubnet3
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Condition: UseCustomGateway
+    # Wait for the instance's cfn-signal (route re-point + NAT set up) before the
+    # stack reports CREATE_COMPLETE.
     CreationPolicy:
       AutoScalingCreationPolicy:
         MinSuccessfulInstancesPercent: 100
@@ -631,47 +670,87 @@ Resources:
         MinSuccessfulInstancesPercent: 100
         PauseTime: PT15M
         WaitOnResourceSignals: true
-    Condition: UseCustomGateway
-  LogGroup:
-    Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName:
-        Fn::Sub: /vpcflowlogs/${ResourcesPrefixName}
+      # Fixed name so the instance role's WatchdogHealth policy can scope
+      # SetInstanceHealth to this exact ASG without a circular reference.
+      AutoScalingGroupName: !Sub '${ResourcesPrefixName}-custom-gw'
+      # Size 1: exists for recovery and Spot placement, not for scaling.
+      MinSize: '1'
+      MaxSize: '1'
+      DesiredCapacity: '1'
+      # Span all three PUBLIC subnets so the instance can launch in whichever AZ
+      # has capacity (availability). It routes private traffic VPC-wide, so its
+      # AZ need not match the private subnets'.
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+        - !Ref PublicSubnet3
+      MixedInstancesPolicy:
+        # Purchase model is driven by GatewayCapacityMode via CapacityModeMap:
+        # SpotLowestPrice (default) / SpotCapacityOptimized / OnDemand.
+        InstancesDistribution:
+          OnDemandBaseCapacity: 0
+          OnDemandPercentageAboveBaseCapacity: !FindInMap [CapacityModeMap, !Ref GatewayCapacityMode, OnDemandPercentage]
+          SpotAllocationStrategy: !FindInMap [CapacityModeMap, !Ref GatewayCapacityMode, SpotStrategy]
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref CustomGwLaunchTemplate
+            Version: !GetAtt CustomGwLaunchTemplate.LatestVersionNumber
+          # A few small diversified types so the Spot strategy has choices.
+          Overrides:
+            - InstanceType: !Ref GatewayInstanceType
+            - InstanceType: t3a.small
+            - InstanceType: t2.small
+      Tags:
+        - Key: Name
+          Value: !Sub ${ResourcesPrefixName}-custom-gw
+          PropagateAtLaunch: true
+
+  ###
+  # VPC flow logs (optional, EnableFlowLogs=true; independent of NetworkMode)
+  ##
+  LogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: EnableFlowLogsCondition
+    Properties:
+      LogGroupName: !Sub /vpcflowlogs/${ResourcesPrefixName}
       RetentionInDays:
         Ref: RetentionInDays
-    Condition: EnableFlowLogsCondition
+
   Role:
-    Type: AWS::IAM::Role
+    Type: 'AWS::IAM::Role'
+    Condition: EnableFlowLogsCondition
     Properties:
       AssumeRolePolicyDocument:
-        Version: "2012-10-17"
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
               Service:
                 - vpc-flow-logs.amazonaws.com
-            Action: sts:AssumeRole
+            Action: 'sts:AssumeRole'
       Policies:
-        - PolicyDocument:
-            Version: "2012-10-17"
+        - PolicyName: flowlogs-policy
+          PolicyDocument:
+            Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                  - logs:DescribeLogGroups
-                  - logs:DescribeLogStreams
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
                 Resource:
-                  Fn::GetAtt:
+                  'Fn::GetAtt':
                     - LogGroup
                     - Arn
-          PolicyName: flowlogs-policy
-    Condition: EnableFlowLogsCondition
+
   FlowLog:
-    Type: AWS::EC2::FlowLog
+    Type: 'AWS::EC2::FlowLog'
+    Condition: EnableFlowLogsCondition
     Properties:
       DeliverLogsPermissionArn:
-        Fn::GetAtt:
+        'Fn::GetAtt':
           - Role
           - Arn
       LogGroupName:
@@ -681,86 +760,105 @@ Resources:
       ResourceType: VPC
       TrafficType:
         Ref: TrafficType
-    Condition: EnableFlowLogsCondition
+
+#################################
+# Outputs
+##
 Outputs:
+
   PubPrivateVPCID:
     Description: VPC ID
     Value:
       Ref: PubPrivateVPC
     Export:
       Name:
-        Fn::Sub: ${AWS::StackName}-VPCId
+        'Fn::Sub': '${AWS::StackName}-VPCId'
+
   PrivateSubnet1ID:
+    Condition: HasPrivateSubnets
     Description: Private Subnet A ID
     Value:
       Ref: PrivateSubnet1
     Export:
       Name:
-        Fn::Sub: ${AWS::StackName}-privateSubnetID1
-    Condition: HasPrivateSubnets
+        'Fn::Sub': '${AWS::StackName}-privateSubnetID1'
+
   PrivateSubnet2ID:
+    Condition: HasPrivateSubnets
     Description: Private Subnet B ID
     Value:
       Ref: PrivateSubnet2
     Export:
       Name:
-        Fn::Sub: ${AWS::StackName}-privateSubnetID2
-    Condition: HasPrivateSubnets
+        'Fn::Sub': '${AWS::StackName}-privateSubnetID2'
+
   PrivateSubnet3ID:
+    Condition: HasPrivateSubnets
     Description: Private Subnet B ID
     Value:
       Ref: PrivateSubnet3
     Export:
       Name:
-        Fn::Sub: ${AWS::StackName}-privateSubnetID3
-    Condition: HasPrivateSubnets
+        'Fn::Sub': '${AWS::StackName}-privateSubnetID3'
+
   PublicSubnet1ID:
     Description: Public Subnet A ID
     Value:
       Ref: PublicSubnet1
     Export:
       Name:
-        Fn::Sub: ${AWS::StackName}-publicSubnetID1
+        'Fn::Sub': '${AWS::StackName}-publicSubnetID1'
+
   PublicSubnet2ID:
     Description: Public Subnet B ID
     Value:
       Ref: PublicSubnet2
     Export:
       Name:
-        Fn::Sub: ${AWS::StackName}-publicSubnetID2
+        'Fn::Sub': '${AWS::StackName}-publicSubnetID2'
+
   PublicSubnet3ID:
     Description: Public Subnet B ID
     Value:
       Ref: PublicSubnet3
     Export:
       Name:
-        Fn::Sub: ${AWS::StackName}-publicSubnetID3
+        'Fn::Sub': '${AWS::StackName}-publicSubnetID3'
+
   LogGroupARN:
-    Description: The name of the CloudWatch Logs log group where the flow logs will be published.
+    Condition: EnableFlowLogsCondition
+    Description: >-
+      The name of the CloudWatch Logs log group where the
+      flow logs will be published.
     Value:
-      Fn::GetAtt:
+      'Fn::GetAtt':
         - LogGroup
         - Arn
-    Condition: EnableFlowLogsCondition
+
   CustomGatewayASGName:
+    Condition: UseCustomGateway
     Description: Auto Scaling group name of the custom routing gateway.
     Value:
       Ref: CustomGwASG
-    Condition: UseCustomGateway
+
   CustomGatewayVpnBucket:
-    Description: Bucket the gateway reads VPN client files from. Upload your config here, then wire the TODO block in the gateway UserData.
+    Condition: UseCustomGateway
+    Description: >-
+      Bucket the gateway reads VPN client files from. Upload your config here,
+      then wire the TODO block in the gateway UserData.
     Value:
       Ref: CustomGwVpnBucket
     Export:
       Name:
-        Fn::Sub: ${AWS::StackName}-customGwVpnBucket
-    Condition: UseCustomGateway
+        'Fn::Sub': '${AWS::StackName}-customGwVpnBucket'
+
   PrivateRouteTableId:
-    Description: Private route table id. Its 0.0.0.0/0 route is managed by the custom gateway instance at boot; handy for confirming the route target.
+    Condition: UseCustomGateway
+    Description: >-
+      Private route table id. Its 0.0.0.0/0 route is managed by the custom
+      gateway instance at boot; handy for confirming the route target.
     Value:
       Ref: PrivateRouteTable
     Export:
       Name:
-        Fn::Sub: ${AWS::StackName}-privateRouteTableId
-    Condition: UseCustomGateway
-
+        'Fn::Sub': '${AWS::StackName}-privateRouteTableId'

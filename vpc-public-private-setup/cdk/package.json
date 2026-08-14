@@ -1,0 +1,21 @@
+{
+  "name": "vpc-public-private-setup-cdk",
+  "version": "1.0.0",
+  "description": "CDK (TypeScript) source for the vpc-public-private-setup CloudFormation template",
+  "private": true,
+  "scripts": {
+    "synth": "cdk synth VpcPublicPrivateSetup",
+    "deploy": "cdk deploy VpcPublicPrivateSetup"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "aws-cdk": "^2.1000.0",
+    "js-yaml": "^4.1.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.160.0",
+    "constructs": "^10.3.0"
+  }
+}
