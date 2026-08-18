@@ -2,7 +2,7 @@
 
 # Fail the stack fast (don't wait for the CreationPolicy timeout) if
 # any command below errors.
-trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackId} --resource CustomGwASG --region ${AWS::Region}' ERR
+trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackId} --resource ${AsgLogicalId} --region ${AWS::Region}' ERR
 
 # --- Identity (IMDSv2) ---
 TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
@@ -106,4 +106,4 @@ systemctl daemon-reload
 systemctl enable --now gw-healthcheck.timer
 
 # Signal success to the CreationPolicy.
-/opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackId} --resource CustomGwASG --region ${AWS::Region}
+/opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackId} --resource ${AsgLogicalId} --region ${AWS::Region}

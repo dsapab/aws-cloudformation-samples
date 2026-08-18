@@ -1,0 +1,101 @@
+import { App, Stack } from 'aws-cdk-lib';
+import { Template } from 'aws-cdk-lib/assertions';
+import { VpcPublicPrivateSetup } from '../lib/vpc-public-private-setup';
+import { VpcPublicPrivateSetupStack } from '../lib/vpc-public-private-setup-stack';
+
+describe('standalone stack (parametric path)', () => {
+  const app = new App();
+  const stack = new VpcPublicPrivateSetupStack(app, 'Standalone');
+  const json = Template.fromStack(stack).toJSON();
+
+  test('exposes the deploy-time parameters', () => {
+    expect(Object.keys(json.Parameters ?? {})).toEqual(
+      expect.arrayContaining([
+        'NetworkMode',
+        'ResourcesPrefixName',
+        'RetentionInDays',
+        'TrafficType',
+        'EnableFlowLogs',
+        'GatewayInstanceType',
+        'GatewayCapacityMode',
+      ]),
+    );
+  });
+
+  test('keeps the conditions', () => {
+    expect(Object.keys(json.Conditions ?? {})).toEqual(
+      expect.arrayContaining(['HasPrivateSubnets', 'UseNatGateway', 'UseCustomGateway', 'EnableFlowLogsCondition']),
+    );
+  });
+
+  test('uses unhashed logical IDs', () => {
+    expect(json.Resources.PubPrivateVPC).toBeDefined();
+    expect(json.Resources.PrivateRouteTable).toBeDefined();
+    expect(json.Resources.CustomGwASG).toBeDefined();
+  });
+});
+
+describe('module use with props (PublicPrivate)', () => {
+  const app = new App();
+  const stack = new Stack(app, 'Consumer');
+  new VpcPublicPrivateSetup(stack, 'Net', { networkMode: 'PublicPrivate' });
+  const template = Template.fromStack(stack);
+  const json = template.toJSON();
+
+  test('injects none of its own parameters or conditions', () => {
+    // The consumer stack may carry a synthesizer BootstrapVersion parameter; what
+    // matters is that the construct adds none of ITS parameters/conditions.
+    const params = Object.keys(json.Parameters ?? {});
+    const conditions = Object.keys(json.Conditions ?? {});
+    for (const p of [
+      'NetworkMode',
+      'ResourcesPrefixName',
+      'RetentionInDays',
+      'TrafficType',
+      'EnableFlowLogs',
+      'GatewayInstanceType',
+      'GatewayCapacityMode',
+    ]) {
+      expect(params).not.toContain(p);
+    }
+    for (const c of ['HasPrivateSubnets', 'UseNatGateway', 'UseCustomGateway', 'EnableFlowLogsCondition']) {
+      expect(conditions).not.toContain(c);
+    }
+  });
+
+  test('builds only the selected layout', () => {
+    template.resourceCountIs('AWS::EC2::NatGateway', 1);
+    template.resourceCountIs('AWS::EC2::Subnet', 6);
+    template.resourceCountIs('AWS::S3::Bucket', 0); // custom-gateway block absent
+    template.resourceCountIs('AWS::AutoScaling::AutoScalingGroup', 0);
+  });
+
+  test('uses hashed logical IDs (not the bare construct id)', () => {
+    expect(json.Resources.PubPrivateVPC).toBeUndefined();
+    expect(Object.keys(json.Resources).some((k) => /^Net.*VPC/.test(k))).toBe(true);
+  });
+});
+
+describe('module use with props (PublicOnly prunes private tier)', () => {
+  const app = new App();
+  const stack = new Stack(app, 'PublicOnly');
+  new VpcPublicPrivateSetup(stack, 'Net', { networkMode: 'PublicOnly' });
+  const template = Template.fromStack(stack);
+
+  test('has only public subnets and no NAT', () => {
+    template.resourceCountIs('AWS::EC2::Subnet', 3);
+    template.resourceCountIs('AWS::EC2::NatGateway', 0);
+  });
+});
+
+describe('multiple instances in one stack', () => {
+  const app = new App();
+  const stack = new Stack(app, 'Multi');
+  new VpcPublicPrivateSetup(stack, 'NetA', { networkMode: 'PublicPrivate', resourcesPrefixName: 'a' });
+  new VpcPublicPrivateSetup(stack, 'NetB', { networkMode: 'PublicPrivate', resourcesPrefixName: 'b' });
+
+  test('synthesizes without logical-ID collision', () => {
+    const template = Template.fromStack(stack);
+    template.resourceCountIs('AWS::EC2::VPC', 2);
+  });
+});

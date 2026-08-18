@@ -26,7 +26,7 @@ endif
 
 ##
 # PHONY Targets - will always run
-.PHONY: prechecks install synth deploy compare clean all
+.PHONY: prechecks install build test synth deploy compare clean all
 
 ##
 # Targets
@@ -39,6 +39,18 @@ install: prechecks
 	@echo -e "\nInstalling CDK dependencies..."
 	@npm install
 	@echo -e "[OK] - Dependencies installed\n"
+
+# Compile the construct to dist/ (JS + type declarations) for module consumers.
+build: install
+	@echo -e "\nBuilding module (tsc -> dist/)..."
+	@npx tsc -p tsconfig.build.json
+	@echo -e "[OK] - Built dist/\n"
+
+# Run the unit tests (both the parametric and props paths).
+test: install
+	@echo -e "\nRunning tests..."
+	@npx jest
+	@echo -e "[OK] - Tests passed\n"
 
 # Produce the deployable CloudFormation template (YAML) from the CDK app.
 # --path-metadata/--version-reporting false keep the output free of CDK-specific
