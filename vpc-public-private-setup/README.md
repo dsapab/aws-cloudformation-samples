@@ -16,6 +16,7 @@ The template is generated from a TypeScript CDK app under [`cdk/`](cdk/). See [B
 - [Outputs](#outputs)
 - [Deploy](#deploy)
 - [Build (CDK)](#build-cdk)
+- [Use as a CDK construct](#use-as-a-cdk-construct)
 - [Things to know](#things-to-know)
 - [Things to do and fix](#things-to-do-and-fix)
 
@@ -143,7 +144,7 @@ The `InstanceId` field should hold the running gateway. Reach the instance itsel
 
 ## Build (CDK)
 
-The template is generated from a TypeScript CDK app under [`cdk/`](cdk/). `vpc-public-private-setup.yaml` is the synth output and the deployable artifact. `vpc-public-private-setup-original.yaml` is the earlier hand-written version, kept for comparison.
+The template is generated from a TypeScript CDK app under [`cdk/`](cdk/). `vpc-public-private-setup.yaml` is the synth output and the deployable artifact. For a one-time sanity check, keep a local copy of the previous hand-written template and diff against it with `make compare`. That copy is not tracked and falls out of date as the template evolves.
 
 The CDK app is a one-to-one, L1-only re-authoring. It keeps `NetworkMode` and the Conditions, so one synthesized template still selects the layout at deploy time, exactly like the original, and preserves every logical ID and export name. The boot script lives as a real file at [`cdk/scripts/gw-bootstrap.sh`](cdk/scripts/gw-bootstrap.sh) and is inlined into the launch-template UserData at synth. It is an `Fn::Sub` template, so `${AWS::Region}`, `${PrivateRouteTable}`, and the other placeholders resolve at deploy time, which is why shellcheck flags those lines.
 
@@ -153,12 +154,47 @@ A Makefile drives the build:
 cd cdk
 make synth      # write ../vpc-public-private-setup.yaml from the CDK app
 make deploy     # deploy with cdk deploy (pass CDK_ARGS="--parameters NetworkMode=...")
-make compare    # structural diff of the generated template against the -original reference
+make compare    # structural diff against a local reference backup (skipped if absent)
 make prechecks  # verify node, npm, and the AWS CLI are present
 make clean      # remove node_modules and cdk.out
 ```
 
 `make synth` and `make deploy` install dependencies first. The stack synthesizes with `CliCredentialsStackSynthesizer`, so the output carries no CDK bootstrap parameters and deploys with either `cdk deploy` or the plain `aws cloudformation deploy` commands above. After editing the CDK source, run `make synth` and commit the regenerated YAML.
+
+## Use as a CDK construct
+
+The same code doubles as an importable construct. `VpcPublicPrivateSetup` (exported from [`cdk/lib/index.ts`](cdk/lib/index.ts)) builds the network directly inside your own stack. Pass it props and it resolves everything at synth time: it builds only the layout you asked for, adds no CloudFormation parameters or conditions to your template, and uses CDK's hashed logical IDs so you can create more than one.
+
+```ts
+import { VpcPublicPrivateSetup } from 'vpc-public-private-setup-cdk';
+
+new VpcPublicPrivateSetup(this, 'Network', {
+  networkMode: 'PublicPrivate',
+  resourcesPrefixName: 'prod-net',
+  enableFlowLogs: true,
+});
+```
+
+Props are all optional. Omitting a field uses the default shown.
+
+| Prop | Default | Notes |
+|------|---------|-------|
+| `networkMode` | `PublicOnly` | `PublicOnly`, `PublicPrivate`, or `PublicPrivateCustomRouting`. Drives which resources are built. |
+| `resourcesPrefixName` | `auto-networking` | Prefix for `Name` tags. Use a distinct value per instance when you create more than one in a stack. |
+| `enableFlowLogs` | `false` | Adds the flow-logs log group, role, and flow log. |
+| `trafficType` | `REJECT` | `ACCEPT`, `REJECT`, or `ALL`. Flow logs only. |
+| `retentionInDays` | `14` | Flow-log retention in days. |
+| `gatewayInstanceType` | `t3.small` | Custom gateway instance type. Custom-routing mode only. |
+| `gatewayCapacityMode` | `SpotLowestPrice` | `SpotLowestPrice`, `SpotCapacityOptimized`, or `OnDemand`. Custom-routing mode only. |
+
+The construct exposes its resources as public fields (`vpc`, `publicSubnets`, `privateSubnets`, `privateRouteTable`, `natGateway`, `vpnBucket`, `gatewayAsg`, `logGroup`, `flowLog`) so you can wire other resources to them. The private-tier fields are `undefined` in modes that don't create them.
+
+Two things to know:
+
+- **Props mode injects no parameters.** That is the difference from the standalone template, which keeps `NetworkMode` and the rest as deploy-time parameters. Passing no props at all makes the construct reproduce that parametric behavior instead, which is exactly what the bundled stack uses.
+- **Multiple instances in one stack each need a distinct `resourcesPrefixName`.** Logical IDs are hashed and unique automatically, but the custom gateway's Auto Scaling group name comes from the stack name and the instance `Name` tag comes from the prefix, so give each instance its own prefix. The common shape is one instance per stack.
+
+To consume it, run `make build` to compile to `dist/`. Within this repo another package can reference it with a relative or workspace dependency. Publishing to npm is not set up yet (the package stays `private`), so a scoped npm publish or a GitHub-install path is the next step for external consumers.
 
 ## Things to know
 

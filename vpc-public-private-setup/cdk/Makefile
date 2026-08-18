@@ -3,7 +3,7 @@
 
 STACK        := VpcPublicPrivateSetup
 TEMPLATE_OUT := ../vpc-public-private-setup.yaml
-ORIGINAL     := ../vpc-public-private-setup-original.yaml
+ORIGINAL     := ../vpc-public-private-setup-orig.yaml.bkp
 CDK          := npx cdk
 
 ##
@@ -68,10 +68,16 @@ deploy: install
 	@echo -e "[OK] - Deploy completed\n"
 
 # Structural diff of the generated template against the original reference.
+# The reference is a local .bkp that goes away as the template evolves, so skip
+# gracefully when it is absent instead of failing.
 compare: synth
-	@echo -e "\nComparing generated template against $(ORIGINAL)..."
-	@node ./tools/compare-templates.js $(ORIGINAL) ./cdk.out/$(STACK).template.json
-	@echo -e "[OK] - Compare completed\n"
+	@if [ -f "$(ORIGINAL)" ]; then \
+		echo -e "\nComparing generated template against $(ORIGINAL)..."; \
+		node ./tools/compare-templates.js "$(ORIGINAL)" ./cdk.out/$(STACK).template.json; \
+		echo -e "[OK] - Compare completed\n"; \
+	else \
+		echo -e "\n[SKIP] - Reference $(ORIGINAL) not found; nothing to compare against.\n"; \
+	fi
 
 clean:
 	@echo -e "\nCleaning..."
