@@ -402,7 +402,10 @@ Resources:
     Properties:
       GroupDescription: Custom routing gateway - allow all traffic from within the VPC
       SecurityGroupIngress:
-        - CidrIp: 10.0.0.0/16
+        - CidrIp:
+            Fn::GetAtt:
+              - PubPrivateVPC
+              - CidrBlock
           IpProtocol: "-1"
       Tags:
         - Key: Name
@@ -599,27 +602,31 @@ Resources:
                 # rules. The unit is ordered before OpenVPN, so DROP is in force before any packet
                 # can be forwarded, and it reprograms itself on every boot.
                 #
-                # Exactly two forward paths ever match. One is out tun0, the private subnets into
-                # the tunnel. The other is out eth0 back into 10.0.0.0/16, the established replies
-                # returning to the VPC. eth0 has to stay in the forward path, since it is the
-                # ingress for client traffic and the egress for return traffic, so it can't be
-                # turned off. Forwarding out eth0 to anything outside the VPC matches no rule and
-                # hits DROP. There is deliberately no eth0 SNAT either, so an unmatched packet
-                # leaves un-NATed and the internet gateway discards it.
+                # The rules are scoped by interface, which is stricter and clearer than matching IP
+                # ranges. Forwarded traffic only ever crosses between the LAN NIC and tun0, so the
+                # two allowed paths are LAN->tun0 outbound and tun0->LAN for established replies.
+                # Anything else hits DROP, and there is no LAN-side SNAT, so an unmatched packet
+                # leaves un-NATed and the internet gateway discards it. The LAN NIC name varies by
+                # instance type (eth0 / ens5 / enX0), so detect it once and persist it for the kill
+                # switch and tunnel scripts to read.
+                LAN_IF=$(ip route show default | awk '{print $5; exit}')
+                echo "$LAN_IF" > /etc/gw-lan-if
+
                 cat > /usr/local/sbin/gw-killswitch.sh <<'KILLSWITCH'
                 #!/bin/bash
                 set -e
+                LAN_IF=$(cat /etc/gw-lan-if)
                 iptables -F FORWARD
                 iptables -t nat -F POSTROUTING
                 iptables -t mangle -F FORWARD
 
                 iptables -P FORWARD DROP
-                # outbound, private subnets may only egress into the tunnel
-                iptables -A FORWARD -s 10.0.0.0/16 -o tun0 -j ACCEPT
-                # return, established replies may only go back into the VPC, never to the internet
-                iptables -A FORWARD -o eth0 -d 10.0.0.0/16 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-                # NAT only through the tunnel (no eth0 SNAT exists, so nothing can leak out eth0)
-                iptables -t nat -A POSTROUTING -s 10.0.0.0/16 -o tun0 -j MASQUERADE
+                # outbound, only traffic forwarded from the LAN NIC into the tunnel
+                iptables -A FORWARD -i "$LAN_IF" -o tun0 -j ACCEPT
+                # return, only established replies coming back from the tunnel to the LAN NIC
+                iptables -A FORWARD -i tun0 -o "$LAN_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+                # NAT everything leaving the tunnel to the tunnel's address
+                iptables -t nat -A POSTROUTING -o tun0 -j MASQUERADE
                 # clamp MSS to the tunnel's lower path MTU so large TCP segments don't blackhole
                 iptables -t mangle -A FORWARD -p tcp --syn -o tun0 -j TCPMSS --clamp-mss-to-pmtu
                 # IPv6 has no forwarding path here. Fail closed if a v6 CIDR ever appears.
@@ -694,17 +701,22 @@ Resources:
                       /etc/openvpn/client/tun-vpn.conf
                   fi
 
-                  # The up-script installs the policy route so only forwarded 10.0.0.0/16 traffic
-                  # uses the tunnel while the box's own default stays on eth0. It runs on every
-                  # reconnect. OpenVPN invokes it with a minimal PATH that omits /usr/sbin, where
-                  # ip lives, so set PATH explicitly. set -e means a failed route setup leaves the
-                  # sentinel untouched, so the boot wait fails closed instead of coming up broken.
+                  # The up-script sends forwarded traffic into the tunnel while the box's own
+                  # traffic (SSM, S3, EC2 API) stays on the main table. It matches the INGRESS
+                  # interface, not the source: forwarded client packets arrive on the LAN NIC,
+                  # whereas the gateway's own packets are locally generated and share the
+                  # 10.0.0.0/16 source range, so a "from 10.0.0.0/16" rule would wrongly divert
+                  # the box's own traffic into the tunnel and cut its control plane. Runs on
+                  # every reconnect. OpenVPN gives up/down scripts a minimal PATH that omits
+                  # /usr/sbin (where ip lives), so set PATH. set -e leaves the sentinel untouched
+                  # on failure, so the boot wait fails closed instead of coming up broken.
                   cat > /etc/openvpn/client/tun-up.sh <<'TUNUP'
                 #!/bin/bash
                 set -e
                 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+                LAN_IF=$(cat /etc/gw-lan-if)
                 ip route replace default dev "$dev" table 100
-                ip rule add from 10.0.0.0/16 lookup 100 priority 100 2>/dev/null || true
+                ip rule add iif "$LAN_IF" lookup 100 priority 100 2>/dev/null || true
                 touch /run/gw-tunnel-up
                 TUNUP
                   chmod 0755 /etc/openvpn/client/tun-up.sh
@@ -712,7 +724,8 @@ Resources:
                   cat > /etc/openvpn/client/tun-down.sh <<'TUNDOWN'
                 #!/bin/bash
                 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-                ip rule del from 10.0.0.0/16 lookup 100 priority 100 2>/dev/null || true
+                LAN_IF=$(cat /etc/gw-lan-if)
+                ip rule del iif "$LAN_IF" lookup 100 priority 100 2>/dev/null || true
                 rm -f /run/gw-tunnel-up
                 TUNDOWN
                   chmod 0755 /etc/openvpn/client/tun-down.sh
@@ -928,7 +941,10 @@ Resources:
     Properties:
       GroupDescription: HTTPS from the VPC to the SSM interface endpoints
       SecurityGroupIngress:
-        - CidrIp: 10.0.0.0/16
+        - CidrIp:
+            Fn::GetAtt:
+              - PubPrivateVPC
+              - CidrBlock
           FromPort: 443
           IpProtocol: tcp
           ToPort: 443

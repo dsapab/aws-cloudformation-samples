@@ -461,7 +461,7 @@ export class VpcPublicPrivateSetup extends Construct {
         vpcId: this.vpc.ref,
         // Forwards private-subnet traffic, so it must accept it. Egress is allow-all
         // by default. No world-facing ingress; manage the box via SSM.
-        securityGroupIngress: [{ ipProtocol: '-1', cidrIp: '10.0.0.0/16' }],
+        securityGroupIngress: [{ ipProtocol: '-1', cidrIp: this.vpc.attrCidrBlock }],
         tags: [{ key: 'Name', value: cfg.prefixName('custom-gw-sg') }],
       }),
     );
@@ -647,7 +647,7 @@ export class VpcPublicPrivateSetup extends Construct {
       new ec2.CfnSecurityGroup(this, 'SsmEndpointSecurityGroup', {
         groupDescription: 'HTTPS from the VPC to the SSM interface endpoints',
         vpcId: this.vpc.ref,
-        securityGroupIngress: [{ ipProtocol: 'tcp', fromPort: 443, toPort: 443, cidrIp: '10.0.0.0/16' }],
+        securityGroupIngress: [{ ipProtocol: 'tcp', fromPort: 443, toPort: 443, cidrIp: this.vpc.attrCidrBlock }],
         tags: [{ key: 'Name', value: cfg.prefixName('ssm-endpoint-sg') }],
       }),
     );
