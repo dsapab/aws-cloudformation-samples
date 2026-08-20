@@ -223,7 +223,7 @@ export class VpcPublicPrivateSetup extends Construct {
         'alternates) so the Spot capacity strategy has choices.',
       ].join('\n'),
       type: 'String',
-      default: 't3.small',
+      default: 't3.micro',
     });
 
     new CfnParameter(this, 'GatewayCapacityMode', {
@@ -321,7 +321,7 @@ export class VpcPublicPrivateSetup extends Construct {
       flowLogsOn: props.enableFlowLogs ?? false,
       trafficType: props.trafficType ?? 'REJECT',
       retentionInDays: props.retentionInDays ?? 14,
-      gatewayInstanceType: props.gatewayInstanceType ?? 't3.small',
+      gatewayInstanceType: props.gatewayInstanceType ?? 't3.micro',
       onDemandPercentage: capacity.onDemandPercentage,
       spotStrategy: capacity.spotStrategy,
     };

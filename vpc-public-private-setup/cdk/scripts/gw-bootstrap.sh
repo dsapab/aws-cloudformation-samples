@@ -26,6 +26,8 @@ IID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
 # up leaky.
 dnf install -y iptables openvpn
 command -v openvpn >/dev/null
+# Convenience tooling for operators. Best-effort so it never blocks boot.
+dnf install -y htop || true
 
 #################################
 # Kernel network settings

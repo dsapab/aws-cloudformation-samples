@@ -101,7 +101,7 @@ OpenVPN comes from the AL2023 repos (the `amzn2023`-tagged build), so the boot s
 | `EnableFlowLogs` | `false` | VPC flow logs to CloudWatch Logs. Works in any mode. |
 | `TrafficType` | `REJECT` | `ACCEPT`, `REJECT`, or `ALL`. Used only with flow logs. |
 | `RetentionInDays` | `14` | Flow log retention. Used only with flow logs. |
-| `GatewayInstanceType` | `t3.small` | Custom gateway instance type and first Spot override. Custom mode only. |
+| `GatewayInstanceType` | `t3.micro` | Custom gateway instance type and first Spot override. Custom mode only. |
 | `GatewayCapacityMode` | `SpotLowestPrice` | `SpotLowestPrice`, `SpotCapacityOptimized`, or `OnDemand`. Custom mode only. |
 | `EnableSsmEndpoints` | `false` | Create SSM interface endpoints so private instances stay reachable when the tunnel is down. Custom mode only. Bills ~$22/month (three endpoints, one AZ) whether used or not. |
 
@@ -190,7 +190,7 @@ Props are all optional. Omitting a field uses the default shown.
 | `enableFlowLogs` | `false` | Adds the flow-logs log group, role, and flow log. |
 | `trafficType` | `REJECT` | `ACCEPT`, `REJECT`, or `ALL`. Flow logs only. |
 | `retentionInDays` | `14` | Flow-log retention in days. |
-| `gatewayInstanceType` | `t3.small` | Custom gateway instance type. Custom-routing mode only. |
+| `gatewayInstanceType` | `t3.micro` | Custom gateway instance type. Custom-routing mode only. |
 | `gatewayCapacityMode` | `SpotLowestPrice` | `SpotLowestPrice`, `SpotCapacityOptimized`, or `OnDemand`. Custom-routing mode only. |
 
 The construct exposes its resources as public fields (`vpc`, `publicSubnets`, `privateSubnets`, `privateRouteTable`, `natGateway`, `vpnBucket`, `gatewayAsg`, `logGroup`, `flowLog`) so you can wire other resources to them. The private-tier fields are `undefined` in modes that don't create them.
