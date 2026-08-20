@@ -6,5 +6,5 @@ Blueprints are authored as CloudFormation templates today. CDK versions are bein
 
 ## Blueprints
 
-- [vpc-public-private-setup](vpc-public-private-setup/README.md). A VPC with three public subnets and optional private subnets. Private egress runs through a managed NAT gateway or a self-healing EC2 Spot gateway you can turn into a VPN router.
+- [cdk-vpc-vpn-gw](https://github.com/trucoit/cdk-vpc-vpn-gw). Formerly `vpc-public-private-setup` here, now its own project. A VPC with three public subnets and optional private subnets, whose private egress runs through a managed NAT gateway or a self-healing EC2 Spot instance running an OpenVPN client with a fail-closed kill switch.
 - [ec2-spot-bastion](ec2-spot-bastion/README.md). One or more bastion hosts on EC2 Spot, each in a size-1 Auto Scaling group that self-heals on reclaim. Optional stable IP and persistent disk.
