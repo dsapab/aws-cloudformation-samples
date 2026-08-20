@@ -162,11 +162,26 @@ down /etc/openvpn/client/tun-down.sh
 mssfix 1360
 OVPN
 
+  # Username/password profiles (NordVPN and similar) carry a bare auth-user-pass
+  # line, which makes OpenVPN block on an interactive prompt under systemd and
+  # time out the boot. When a credentials file was uploaded (two lines, the
+  # service username then the password), point the directive at it so bring-up
+  # stays non-interactive. Lock the file down first, since it holds a secret.
+  if [ -f /etc/vpn/credentials.txt ]; then
+    chmod 600 /etc/vpn/credentials.txt
+    sed -i 's#^[[:space:]]*auth-user-pass[[:space:]]*$#auth-user-pass /etc/vpn/credentials.txt#' \
+      /etc/openvpn/client/tun-vpn.conf
+  fi
+
   # The up-script installs the policy route so only forwarded 10.0.0.0/16 traffic
   # uses the tunnel while the box's own default stays on eth0. It runs on every
-  # reconnect.
+  # reconnect. OpenVPN invokes it with a minimal PATH that omits /usr/sbin, where
+  # ip lives, so set PATH explicitly. set -e means a failed route setup leaves the
+  # sentinel untouched, so the boot wait fails closed instead of coming up broken.
   cat > /etc/openvpn/client/tun-up.sh <<'TUNUP'
 #!/bin/bash
+set -e
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 ip route replace default dev "$dev" table 100
 ip rule add from 10.0.0.0/16 lookup 100 priority 100 2>/dev/null || true
 touch /run/gw-tunnel-up
@@ -175,6 +190,7 @@ TUNUP
 
   cat > /etc/openvpn/client/tun-down.sh <<'TUNDOWN'
 #!/bin/bash
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 ip rule del from 10.0.0.0/16 lookup 100 priority 100 2>/dev/null || true
 rm -f /run/gw-tunnel-up
 TUNDOWN
@@ -207,6 +223,11 @@ if [ -f /run/gw-vpn-configured ]; then
   #################################
   # Verify egress
   ##
+  # The policy route the up-script installs is what sends forwarded client traffic
+  # into the tunnel. Confirm it is actually there, since a curl bound to tun0 would
+  # pass even without it and hide a broken forwarded path.
+  ip rule | grep -q 'lookup 100'
+  ip route show table 100 | grep -q '^default'
   # Confirm traffic actually leaves through the tunnel. The exit IP seen over tun0
   # must be non-empty and differ from this box's own public IP, which is the EIP.
   TUNIP=$(curl -s --interface tun0 --max-time 5 https://checkip.amazonaws.com || true)

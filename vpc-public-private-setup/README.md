@@ -80,8 +80,9 @@ A systemd timer runs a check about once a minute. It confirms the private route 
 
 Custom mode runs a real OpenVPN client and makes private egress fail-closed. The stack creates a private, encrypted S3 bucket for the VPN files, whose name comes back as the `CustomGatewayVpnBucket` output. To turn the tunnel on:
 
-1. Upload an OpenVPN profile to the bucket, for example `aws s3 cp client.ovpn s3://<CustomGatewayVpnBucket>/`. Embed the certs and key in the file, or ship an `auth-user-pass` file next to it.
-2. Refresh the gateway (terminate the instance, or trigger an Auto Scaling instance refresh). The replacement pulls the profile into `/etc/vpn`, strips any `redirect-gateway`, `route`, or `dev` lines that would fight the routing below, and starts `openvpn-client@tun-vpn`.
+1. Upload an OpenVPN profile to the bucket, for example `aws s3 cp client.ovpn s3://<CustomGatewayVpnBucket>/`. Certs and keys can be embedded in the file.
+2. For a username/password profile (NordVPN and most commercial providers), also upload a `credentials.txt` with the username on line 1 and the password on line 2: `printf '%s\n%s\n' USER PASS > credentials.txt && aws s3 cp credentials.txt s3://<CustomGatewayVpnBucket>/`. The boot script points the profile's bare `auth-user-pass` at it and locks the file to `0600`, so the tunnel comes up without an interactive prompt. With NordVPN, use the **service credentials** from the Nord dashboard (Nord Account, Services, NordVPN, "Set up NordVPN manually"), not your account login.
+3. Refresh the gateway (terminate the instance, or trigger an Auto Scaling instance refresh). The replacement pulls the files into `/etc/vpn`, strips any `redirect-gateway`, `route`, or `dev` lines that would fight the routing below, and starts `openvpn-client@tun-vpn`.
 
 Forwarded traffic reaches the internet through the VPN server, not the gateway. Policy routing (`ip rule from 10.0.0.0/16 lookup 100`) sends only the private tier into `tun0` and leaves the box's own traffic (SSM, S3, the EC2 and Auto Scaling APIs) on eth0, so the instance stays reachable over Session Manager even when the tunnel is down.
 
@@ -102,6 +103,7 @@ OpenVPN comes from the AL2023 repos (the `amzn2023`-tagged build), so the boot s
 | `RetentionInDays` | `14` | Flow log retention. Used only with flow logs. |
 | `GatewayInstanceType` | `t3.small` | Custom gateway instance type and first Spot override. Custom mode only. |
 | `GatewayCapacityMode` | `SpotLowestPrice` | `SpotLowestPrice`, `SpotCapacityOptimized`, or `OnDemand`. Custom mode only. |
+| `EnableSsmEndpoints` | `false` | Create SSM interface endpoints so private instances stay reachable when the tunnel is down. Custom mode only. Bills ~$22/month (three endpoints, one AZ) whether used or not. |
 
 Custom mode also creates a private S3 bucket for VPN files. There is no parameter for it. The bucket name comes back as an output.
 
@@ -217,6 +219,6 @@ The kill switch and the OpenVPN tunnel are wired now, and egress is fail-closed 
 - **Bake OpenVPN into an AMI.** The boot script installs OpenVPN and iptables from the AL2023 repos at launch, which works but adds a package download to every boot. Pre-installing both into a custom AMI and pointing the launch template's `imageId` there makes bring-up faster and removes the boot-time dependency on the repo being reachable.
 - **Tell "peer down" apart from "my egress broke."** The watchdog retries once and waits for five failures before replacing, which absorbs a brief blip. It still cannot distinguish an unreachable VPN peer from a broken local route, so if the peer stays down the group replaces the instance in a loop that fixes nothing. Probe the peer's host and port directly and hold the instance in service when only the peer is at fault.
 - **The kill switch covers forwarded traffic only.** Anything running on the gateway still reaches the internet through eth0 for SSM, S3, and CloudFormation. If a compromised gateway is in your threat model, restrict the OUTPUT chain too, while leaving SSM, S3, and the CloudFormation endpoint reachable.
-- **No private SSM path.** Session Manager to a private-subnet instance currently rides the gateway's internet egress, so a down gateway also means no SSM access. Add interface VPC endpoints for `ssm`, `ssmmessages`, and `ec2messages` (with a security group allowing 443 from the VPC CIDR) so private instances stay reachable over SSM without any internet path.
+- **Private SSM path is opt-in.** By default, Session Manager to a private-subnet instance rides the gateway's internet egress, so a down tunnel also means no SSM access. Set `EnableSsmEndpoints=true` to add interface endpoints for `ssm`, `ssmmessages`, and `ec2messages` (443 from the VPC CIDR, private DNS on) so private instances stay reachable regardless of the tunnel. It is off by default because the endpoints bill ~$22/month whether used or not. They land in a single AZ to hold that cost down, which means the SSM path itself is not AZ-redundant.
 - **Handle IPv6 before you enable it.** The VPC is IPv4-only today and the boot script already sets `ip6tables -P FORWARD DROP` and turns v6 forwarding off. If you add an IPv6 CIDR you still need to build the v6 equivalents of the tunnel routing and NAT, or the private tier simply has no v6 egress.
 - **A GitHub Actions workflow to run `cdk synth`.** The build is Makefile-driven locally (see [Build (CDK)](#build-cdk)). CI to regenerate and publish the template on push is not wired yet.

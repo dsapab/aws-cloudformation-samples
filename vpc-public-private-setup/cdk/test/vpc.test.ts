@@ -1,5 +1,5 @@
 import { App, Stack } from 'aws-cdk-lib';
-import { Template } from 'aws-cdk-lib/assertions';
+import { Match, Template } from 'aws-cdk-lib/assertions';
 import { VpcPublicPrivateSetup } from '../lib/vpc-public-private-setup';
 import { VpcPublicPrivateSetupStack } from '../lib/vpc-public-private-setup-stack';
 
@@ -18,6 +18,7 @@ describe('standalone stack (parametric path)', () => {
         'EnableFlowLogs',
         'GatewayInstanceType',
         'GatewayCapacityMode',
+        'EnableSsmEndpoints',
       ]),
     );
   });
@@ -55,6 +56,7 @@ describe('module use with props (PublicPrivate)', () => {
       'EnableFlowLogs',
       'GatewayInstanceType',
       'GatewayCapacityMode',
+      'EnableSsmEndpoints',
     ]) {
       expect(params).not.toContain(p);
     }
@@ -105,6 +107,30 @@ describe('custom gateway (PublicPrivateCustomRouting)', () => {
     expect(raw).toContain('openvpn-client@tun-vpn');
     expect(raw).toContain('rp_filter');
     expect(raw).toContain('associate-address');
+  });
+
+  test('creates no SSM endpoints by default (cost opt-in)', () => {
+    template.resourceCountIs('AWS::EC2::VPCEndpoint', 0);
+  });
+});
+
+describe('custom gateway with SSM endpoints enabled', () => {
+  const app = new App();
+  const stack = new Stack(app, 'CustomGwSsm');
+  new VpcPublicPrivateSetup(stack, 'Net', {
+    networkMode: 'PublicPrivateCustomRouting',
+    enableSsmEndpoints: true,
+  });
+  const template = Template.fromStack(stack);
+
+  test('adds the three SSM interface endpoints in a single AZ', () => {
+    template.resourceCountIs('AWS::EC2::VPCEndpoint', 3);
+    // Each endpoint sits in exactly one subnet to keep the per-ENI cost down.
+    template.hasResourceProperties('AWS::EC2::VPCEndpoint', {
+      VpcEndpointType: 'Interface',
+      PrivateDnsEnabled: true,
+      SubnetIds: [{ Ref: Match.anyValue() }],
+    });
   });
 });
 

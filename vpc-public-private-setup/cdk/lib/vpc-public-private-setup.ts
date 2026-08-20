@@ -97,6 +97,15 @@ export interface VpcPublicPrivateSetupProps {
   readonly retentionInDays?: number;
   readonly gatewayInstanceType?: string;
   readonly gatewayCapacityMode?: GatewayCapacityMode;
+  /**
+   * Create SSM interface endpoints (ssm, ssmmessages, ec2messages) so private
+   * instances stay reachable over Session Manager when the tunnel is down.
+   * Custom gateway only. Defaults to false, because these endpoints bill per
+   * hour whether used or not (roughly $22/month for the three in one AZ). Set
+   * true when you need SSM access to private instances that does not depend on
+   * the gateway's tunnel being up.
+   */
+  readonly enableSsmEndpoints?: boolean;
 }
 
 /** Resolved configuration shared by the build methods. */
@@ -106,6 +115,7 @@ interface Cfg {
   hasPrivate: Gate;
   useNat: Gate;
   useCustom: Gate;
+  ssmEndpointsOn: Gate;
   flowLogsOn: Gate;
   trafficType: string;
   retentionInDays: number;
@@ -151,7 +161,8 @@ export class VpcPublicPrivateSetup extends Construct {
       props.trafficType === undefined &&
       props.retentionInDays === undefined &&
       props.gatewayInstanceType === undefined &&
-      props.gatewayCapacityMode === undefined;
+      props.gatewayCapacityMode === undefined &&
+      props.enableSsmEndpoints === undefined;
 
     return parametric ? this.parametricConfig() : this.literalConfig(props);
   }
@@ -230,6 +241,20 @@ export class VpcPublicPrivateSetup extends Construct {
       allowedValues: ['SpotLowestPrice', 'SpotCapacityOptimized', 'OnDemand'],
     });
 
+    const enableSsmEndpoints = new CfnParameter(this, 'EnableSsmEndpoints', {
+      description: [
+        'Create SSM interface endpoints (ssm, ssmmessages, ec2messages) so private',
+        'instances stay reachable over Session Manager when the gateway tunnel is',
+        'down. Used only when NetworkMode=PublicPrivateCustomRouting.',
+        'COST: these bill per hour whether used or not, roughly $22/month for the',
+        'three endpoints in one AZ. Leave false unless you need tunnel-independent',
+        'SSM access to private instances.',
+      ].join('\n'),
+      type: 'String',
+      default: 'false',
+      allowedValues: ['true', 'false'],
+    });
+
     // Interface groups our parameters. Stack-level, so set it on the stack.
     Stack.of(this).templateOptions.metadata = {
       'AWS::CloudFormation::Interface': {
@@ -241,7 +266,7 @@ export class VpcPublicPrivateSetup extends Construct {
           },
           {
             Label: { default: 'Custom routing gateway (NetworkMode=PublicPrivateCustomRouting) ...' },
-            Parameters: ['GatewayInstanceType', 'GatewayCapacityMode'],
+            Parameters: ['GatewayInstanceType', 'GatewayCapacityMode', 'EnableSsmEndpoints'],
           },
         ],
       },
@@ -260,6 +285,12 @@ export class VpcPublicPrivateSetup extends Construct {
       }),
       useCustom: new CfnCondition(this, 'UseCustomGateway', {
         expression: Fn.conditionEquals(networkMode.valueAsString, 'PublicPrivateCustomRouting'),
+      }),
+      ssmEndpointsOn: new CfnCondition(this, 'EnableSsmEndpointsCondition', {
+        expression: Fn.conditionAnd(
+          Fn.conditionEquals(networkMode.valueAsString, 'PublicPrivateCustomRouting'),
+          Fn.conditionEquals(enableSsmEndpoints.valueAsString, 'true'),
+        ),
       }),
       flowLogsOn: new CfnCondition(this, 'EnableFlowLogsCondition', {
         expression: Fn.conditionEquals(enableFlowLogs.valueAsString, 'true'),
@@ -286,6 +317,7 @@ export class VpcPublicPrivateSetup extends Construct {
       hasPrivate: mode !== 'PublicOnly',
       useNat: mode === 'PublicPrivate',
       useCustom: mode === 'PublicPrivateCustomRouting',
+      ssmEndpointsOn: mode === 'PublicPrivateCustomRouting' && (props.enableSsmEndpoints ?? false),
       flowLogsOn: props.enableFlowLogs ?? false,
       trafficType: props.trafficType ?? 'REJECT',
       retentionInDays: props.retentionInDays ?? 14,
@@ -600,12 +632,18 @@ export class VpcPublicPrivateSetup extends Construct {
       return asg;
     });
 
-    // SSM Session Manager access for private-subnet instances, independent of the
-    // gateway. Without these, SSM to a private instance rides the gateway's
-    // internet egress, so a down tunnel also means no way in to fix it. Three
-    // interface endpoints (ssm, ssmmessages, ec2messages) plus private DNS keep
-    // the SSM control path inside the VPC. Only built with the custom gateway.
-    const ssmEndpointSg = gated(cfg.useCustom, () =>
+    // Optional SSM Session Manager access for private-subnet instances,
+    // independent of the gateway. Without these, SSM to a private instance rides
+    // the gateway's internet egress, so a down tunnel also means no way in to fix
+    // it. Three interface endpoints (ssm, ssmmessages, ec2messages) plus private
+    // DNS keep the SSM control path inside the VPC.
+    //
+    // COST: interface endpoints bill per ENI-hour whether used or not. These sit
+    // in ONE private subnet (one AZ), so three ENIs, roughly $22/month plus a
+    // little data processing. Off by default (see enableSsmEndpoints); putting
+    // them in all three AZs would triple that, and the gateway is a single
+    // instance anyway, so one AZ matches the rest of the design.
+    const ssmEndpointSg = gated(cfg.ssmEndpointsOn, () =>
       new ec2.CfnSecurityGroup(this, 'SsmEndpointSecurityGroup', {
         groupDescription: 'HTTPS from the VPC to the SSM interface endpoints',
         vpcId: this.vpc.ref,
@@ -619,14 +657,14 @@ export class VpcPublicPrivateSetup extends Construct {
       { key: 'ssmmessages', id: 'SsmMessagesEndpoint' },
       { key: 'ec2messages', id: 'Ec2MessagesEndpoint' },
     ]) {
-      const endpoint = gated(cfg.useCustom, () =>
+      const endpoint = gated(cfg.ssmEndpointsOn, () =>
         new ec2.CfnVPCEndpoint(this, svc.id, {
           vpcId: this.vpc.ref,
           serviceName: Fn.sub(`com.amazonaws.\${AWS::Region}.${svc.key}`),
           vpcEndpointType: 'Interface',
           privateDnsEnabled: true,
-          // One ENI per private subnet, so each AZ resolves the endpoint locally.
-          subnetIds: this.privateSubnets.map((s) => s.ref),
+          // One AZ only, to keep the per-ENI cost down (see the note above).
+          subnetIds: [this.privateSubnets[0].ref],
           securityGroupIds: [ssmEndpointSg!.ref],
         }),
       );
