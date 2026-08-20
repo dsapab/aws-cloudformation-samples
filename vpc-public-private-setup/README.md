@@ -40,7 +40,7 @@ The custom gateway borrows the pattern from the sibling `ec2-spot-bastion` templ
 
 The instance lives in the **public** subnets, because it needs a path to the internet gateway to reach whatever the private tier egresses to. The private subnets route through it. This is the same placement the managed NAT gateway uses.
 
-At boot the instance does four things. It turns on IPv4 forwarding, disables its own source/destination check so it can forward packets not addressed to it, points the private route table's `0.0.0.0/0` at itself, and adds an `iptables` MASQUERADE rule so private-subnet traffic is NAT'd out its primary interface. After that the private tier has working internet egress even before any VPN exists.
+At boot the instance sets itself up as a fail-closed VPN router. It turns on IPv4 forwarding, disables its own source/destination check so it can forward packets not addressed to it, and associates the stack's Elastic IP so its egress address is stable. It then installs the kill-switch firewall (a systemd unit that default-drops the `FORWARD` chain and allows forwarding only out `tun0`), brings up an OpenVPN tunnel from the profile in `/etc/vpn`, and confirms traffic actually leaves through it. Only then does it point the private route table's `0.0.0.0/0` at itself. If no VPN profile has been uploaded yet, the box still comes up, but the kill switch drops all private egress until you add one.
 
 ### One roaming instance, not a fixed ENI
 
@@ -74,18 +74,22 @@ The Auto Scaling group lists a few small instance types as overrides (`GatewayIn
 
 An Auto Scaling group only checks EC2 and system status. An instance can boot fine, then fail to set its route or lose egress, and the group would leave it in service black-holing traffic.
 
-A systemd timer runs a check about once a minute. It confirms the private route still targets this instance and that general egress works. If either fails, it calls `set-instance-health --health-status Unhealthy`, and the group terminates and replaces the instance. When you wire the VPN, extend the check to require the tunnel interface up.
+A systemd timer runs a check about once a minute. It confirms the private route still targets this instance, that `tun0` is up, and that the exit IP seen over the tunnel differs from the box's own address, so a leaking or tunnel-down box reads as unhealthy. Before it escalates it tries one OpenVPN restart, and it only calls `set-instance-health --health-status Unhealthy` after five failures in a row, so a booting instance or a brief tunnel blip does not trigger a replacement. The check stays quiet until boot finishes, which keeps it from racing the tunnel bring-up.
 
-### Layering a VPN on top
+### The VPN and the kill switch
 
-The template stops at working NAT egress on purpose. Custom mode creates a private, encrypted S3 bucket for the VPN client files. Its name comes back as the `CustomGatewayVpnBucket` output. The bucket starts empty, and the boot script copies its whole contents into `/etc/vpn` on every launch, so an empty bucket is a no-op until you upload something. To finish the VPN:
+Custom mode runs a real OpenVPN client and makes private egress fail-closed. The stack creates a private, encrypted S3 bucket for the VPN files, whose name comes back as the `CustomGatewayVpnBucket` output. To turn the tunnel on:
 
-1. Upload your client config to the bucket, for example `aws s3 cp client.conf s3://<CustomGatewayVpnBucket>/`.
-2. In the boot script's `TODO: VPN connect` block, install the client (for example `dnf install -y vpnc`) and connect using the files in `/etc/vpn`.
-3. Move the MASQUERADE rule from the primary interface to `tun0` so private egress leaves through the tunnel instead of the public subnet.
-4. Add `ip link show tun0` to the watchdog so a dropped tunnel triggers a replacement.
+1. Upload an OpenVPN profile to the bucket, for example `aws s3 cp client.ovpn s3://<CustomGatewayVpnBucket>/`. Embed the certs and key in the file, or ship an `auth-user-pass` file next to it.
+2. Refresh the gateway (terminate the instance, or trigger an Auto Scaling instance refresh). The replacement pulls the profile into `/etc/vpn`, strips any `redirect-gateway`, `route`, or `dev` lines that would fight the routing below, and starts `openvpn-client@tun-vpn`.
 
-The instance role's `s3:GetObject` and `s3:ListBucket` are already scoped to this one bucket, so no permission change is needed when you upload.
+Forwarded traffic reaches the internet through the VPN server, not the gateway. Policy routing (`ip rule from 10.0.0.0/16 lookup 100`) sends only the private tier into `tun0` and leaves the box's own traffic (SSM, S3, the EC2 and Auto Scaling APIs) on eth0, so the instance stays reachable over Session Manager even when the tunnel is down.
+
+The kill switch is the `FORWARD` chain. The default policy is DROP, and the only forward paths that match are out `tun0` and established replies back into `10.0.0.0/16`. When the tunnel drops, nothing matches the `tun0` rule and every forwarded packet dies at the DROP policy, so no traffic falls back to the public path. There is no eth0 MASQUERADE, so even an unmatched packet leaves un-NAT'd and the internet gateway discards it. A reboot reprograms all of this from `gw-killswitch.service`, ordered before OpenVPN, so the switch is never briefly open.
+
+The gateway carries the stack's Elastic IP (`CustomGatewayEip` output), re-associated on every launch, so the tunnel's source address is stable across Spot replacements. Allowlist that address on your VPN peer.
+
+OpenVPN comes from the AL2023 repos (the `amzn2023`-tagged build), so the boot script installs it with a plain `dnf install` and pulls in no third-party repo. If you want faster, fully self-contained boots, bake OpenVPN into a custom AMI and point the launch template's `imageId` at it, so bring-up never waits on a package download at all. The instance role's `s3:GetObject` and `s3:ListBucket` are already scoped to this one bucket, so uploading needs no permission change.
 
 ## Parameters
 
@@ -201,32 +205,18 @@ To consume it, run `make build` to compile to `dist/`. Within this repo another 
 - **The default route is instance-managed in custom mode.** CloudFormation does not own the `0.0.0.0/0` route there. The instance writes it at boot. Do not add a static route to the private table in that mode.
 - **Egress gaps on replacement.** A Spot reclaim drops private egress until the replacement finishes booting. Use `OnDemand` or `SpotCapacityOptimized` to reduce how often that happens.
 - **Single gateway, single point of failure.** One instance carries the whole private tier's egress. An AZ loss takes it down until the group launches elsewhere. Per-AZ redundancy is out of scope here.
-- **iptables rules are set at boot, not persisted.** A reboot of the same instance would lose them. That is fine for an ephemeral Spot instance that reruns its boot script on every launch, but worth knowing before you treat the box as long-lived.
-- **Permissions are scoped to what this stack creates.** The gateway role can re-point only its own private route table, set health only on its own Auto Scaling group, and read only its own VPN bucket. Disabling the source/dest check is limited to instances tagged as this gateway. The two exceptions are `ec2:DescribeRouteTables` and the `AmazonSSMManagedInstanceCore` managed policy, neither of which AWS lets you scope to a single resource.
+- **The firewall reasserts itself on every boot.** The kill switch lives in `gw-killswitch.service`, ordered before OpenVPN, not only in the one-time user-data. A reboot of the same instance reprograms the DROP policy and the tunnel-only rules before any forwarding can happen, so a reboot never opens the switch even for a moment.
+- **Permissions are scoped to what this stack creates.** The gateway role can re-point only its own private route table, set health only on its own Auto Scaling group, and read only its own VPN bucket. Disabling the source/dest check is limited to instances tagged as this gateway, and associating the Elastic IP is scoped to the stack's own allocation. The exceptions AWS will not let you scope to a single resource are `ec2:DescribeRouteTables`, `ec2:DescribeAddresses`, and the `AmazonSSMManagedInstanceCore` managed policy.
 - **The VPN bucket blocks stack deletion if it holds files.** S3 refuses to delete a bucket that still has objects, so empty it before you tear the stack down. There is no auto-delete on it.
 - **The CIDR is fixed at 10.0.0.0/16.** Subnets are carved from it (`10.0.1.0/24` through `10.0.6.0/24`), and the gateway's MASQUERADE source is the same `/16`. Change all of them together if you re-CIDR.
 
 ## Things to do and fix
 
-None of this is wired yet. The template stops at working NAT egress, and the VPN path is a scaffold. This is the punch list before you rely on the custom gateway for anything that must stay private.
+The kill switch and the OpenVPN tunnel are wired now, and egress is fail-closed on `tun0`. What is left is hardening and convenience.
 
-### Make private egress leak-proof
-
-The boot script is fail-open today. The private route points at the gateway and the MASQUERADE rule sends traffic out the public interface ([line 576](vpc-public-private-setup.yaml#L576)) before any VPN exists. Even after you add a tunnel, two leaks remain. Between boot and the tunnel coming up, private traffic egresses through the internet gateway in the clear. If the tunnel later drops, the eth0 MASQUERADE rule is still in place and traffic falls back to the public path.
-
-A security group or NACL cannot fix this, because every forwarded packet leaves the same public ENI whether the tunnel is up or down. The kill switch has to live on the instance.
-
-- **Drop the eth0 MASQUERADE for client traffic.** Remove the `-o "$PRIMARY_IF"` rule the boot script adds today and NAT only the tunnel with `iptables -t nat -A POSTROUTING -s 10.0.0.0/16 -o tun0 -j MASQUERADE`.
-- **Default-deny the FORWARD chain.** Set `iptables -P FORWARD DROP`, then allow only `-s 10.0.0.0/16 -o tun0` outbound and the established return path inbound. When tun0 is gone, the allow rule stops matching and the DROP policy kills the packet. That is the kill switch, and it works with no monitoring.
-- **Bring the tunnel up before re-pointing the route.** Move the `ReplaceRoute`/`CreateRoute` step to after the tunnel is up. Until then the private route stays blackholed, which is fail-closed downtime instead of a leak.
-- **Verify the tunnel in the watchdog.** The check at [line 613](vpc-public-private-setup.yaml#L613) passes as long as any egress works, including the leaky path. Require `ip link show tun0` up and confirm the exit IP matches the VPN's, so a leaking box reads as unhealthy and gets replaced.
-- **Clamp MSS.** A tunnel lowers the path MTU. Add `iptables -t mangle -A FORWARD -p tcp --syn -j TCPMSS --clamp-mss-to-pmtu` or large packets blackhole.
-- **Handle IPv6 before you enable it.** The VPC is IPv4-only today, so nothing leaks over v6. Add an IPv6 CIDR and you must replicate every rule above in `ip6tables` and disable IPv6 forwarding, or you have opened an unfiltered bypass.
-
-### Other gaps to close
-
-- **No Elastic IP.** The public IP changes on every replacement. If your VPN peer allowlists by source IP, each Spot reclaim breaks the tunnel until you update the peer. Associate an EIP at boot, or front the gateway with a stable address, when the peer filters by IP.
-- **Watchdog thrash when the peer is down.** A tunnel check that fails because the remote end is unreachable marks every fresh instance unhealthy, so the group replaces it in a loop that fixes nothing. Separate "my route or egress is broken" from "the peer is down" before calling `set-instance-health`.
+- **Bake OpenVPN into an AMI.** The boot script installs OpenVPN and iptables from the AL2023 repos at launch, which works but adds a package download to every boot. Pre-installing both into a custom AMI and pointing the launch template's `imageId` there makes bring-up faster and removes the boot-time dependency on the repo being reachable.
+- **Tell "peer down" apart from "my egress broke."** The watchdog retries once and waits for five failures before replacing, which absorbs a brief blip. It still cannot distinguish an unreachable VPN peer from a broken local route, so if the peer stays down the group replaces the instance in a loop that fixes nothing. Probe the peer's host and port directly and hold the instance in service when only the peer is at fault.
 - **The kill switch covers forwarded traffic only.** Anything running on the gateway still reaches the internet through eth0 for SSM, S3, and CloudFormation. If a compromised gateway is in your threat model, restrict the OUTPUT chain too, while leaving SSM, S3, and the CloudFormation endpoint reachable.
 - **No private SSM path.** Session Manager to a private-subnet instance currently rides the gateway's internet egress, so a down gateway also means no SSM access. Add interface VPC endpoints for `ssm`, `ssmmessages`, and `ec2messages` (with a security group allowing 443 from the VPC CIDR) so private instances stay reachable over SSM without any internet path.
+- **Handle IPv6 before you enable it.** The VPC is IPv4-only today and the boot script already sets `ip6tables -P FORWARD DROP` and turns v6 forwarding off. If you add an IPv6 CIDR you still need to build the v6 equivalents of the tunnel routing and NAT, or the private tier simply has no v6 egress.
 - **A GitHub Actions workflow to run `cdk synth`.** The build is Makefile-driven locally (see [Build (CDK)](#build-cdk)). CI to regenerate and publish the template on push is not wired yet.

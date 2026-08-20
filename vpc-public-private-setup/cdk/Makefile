@@ -26,7 +26,7 @@ endif
 
 ##
 # PHONY Targets - will always run
-.PHONY: prechecks install build test synth deploy compare clean all
+.PHONY: prechecks install build test synth template deploy compare clean all
 
 ##
 # Targets
@@ -59,6 +59,9 @@ synth: install
 	@echo -e "\nSynthesizing $(STACK) to $(TEMPLATE_OUT)..."
 	@$(CDK) synth $(STACK) --path-metadata false --version-reporting false > $(TEMPLATE_OUT)
 	@echo -e "[OK] - Wrote $(TEMPLATE_OUT)\n"
+
+# Alias for synth: produce the deployable CloudFormation template.
+template: synth
 
 # Build and deploy the stack directly with CDK. Pass extra args via CDK_ARGS, e.g.
 # make deploy CDK_ARGS="--parameters NetworkMode=PublicPrivateCustomRouting"

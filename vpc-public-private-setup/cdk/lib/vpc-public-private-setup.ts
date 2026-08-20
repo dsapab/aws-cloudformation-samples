@@ -122,6 +122,8 @@ export class VpcPublicPrivateSetup extends Construct {
   public privateRouteTable?: ec2.CfnRouteTable;
   public natGateway?: ec2.CfnNatGateway;
   public vpnBucket?: s3.CfnBucket;
+  public customGwEip?: ec2.CfnEIP;
+  public readonly ssmEndpoints: ec2.CfnVPCEndpoint[] = [];
   public gatewayAsg?: autoscaling.CfnAutoScalingGroup;
   public logGroup?: logs.CfnLogGroup;
   public flowLog?: ec2.CfnFlowLog;
@@ -411,6 +413,16 @@ export class VpcPublicPrivateSetup extends Construct {
       }),
     );
 
+    // Stack-owned Elastic IP: it outlives instance replacement, and each booting
+    // instance re-associates it (see gw-bootstrap.sh) so the VPN tunnel's source
+    // IP is stable and a peer-side IP allowlist keeps working across Spot churn.
+    this.customGwEip = gated(cfg.useCustom, () =>
+      new ec2.CfnEIP(this, 'CustomGwEip', {
+        domain: 'vpc',
+        tags: [{ key: 'Name', value: cfg.prefixName('custom-gw-eip') }],
+      }),
+    );
+
     const securityGroup = gated(cfg.useCustom, () =>
       new ec2.CfnSecurityGroup(this, 'CustomGwSecurityGroup', {
         groupDescription: 'Custom routing gateway - allow all traffic from within the VPC',
@@ -457,8 +469,30 @@ export class VpcPublicPrivateSetup extends Construct {
                   Resource: Fn.sub('arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'),
                   Condition: { StringEquals: { 'aws:ResourceTag/Name': cfg.prefixName('custom-gw') } },
                 },
-                // EC2 Describe* cannot be resource-scoped, so this must be '*'.
-                { Sid: 'DescribeRouteTables', Effect: 'Allow', Action: 'ec2:DescribeRouteTables', Resource: '*' },
+                // Associate the stack's Elastic IP with this instance at boot so the
+                // VPN tunnel egresses from a stable address. AssociateAddress authorizes
+                // against the instance, the EIP, and the ENI at once, so all three must
+                // be granted. The EIP is scoped to this stack's allocation; a tag
+                // condition can't be used here because it would fail on the untagged ENI.
+                {
+                  Sid: 'AssociateEip',
+                  Effect: 'Allow',
+                  Action: 'ec2:AssociateAddress',
+                  Resource: [
+                    Fn.sub('arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:elastic-ip/${id}', {
+                      id: this.customGwEip!.attrAllocationId,
+                    }),
+                    Fn.sub('arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'),
+                    Fn.sub('arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'),
+                  ],
+                },
+                // EC2 Describe* cannot be resource-scoped, so these must be '*'.
+                {
+                  Sid: 'DescribeForRouteAndEip',
+                  Effect: 'Allow',
+                  Action: ['ec2:DescribeRouteTables', 'ec2:DescribeAddresses'],
+                  Resource: '*',
+                },
                 // Watchdog marks this ASG's instance unhealthy. Scoped by the ASG name,
                 // which is stack-scoped (matches the AutoScalingGroupName below).
                 {
@@ -510,6 +544,7 @@ export class VpcPublicPrivateSetup extends Construct {
               AsgLogicalId: asgLogicalId,
               PrivateRouteTable: this.privateRouteTable!.ref,
               CustomGwVpnBucket: this.vpnBucket!.ref,
+              CustomGwEipAllocId: this.customGwEip!.attrAllocationId,
             }),
           ),
           tagSpecifications: [{ resourceType: 'instance', tags: [{ key: 'Name', value: cfg.prefixName('custom-gw') }] }],
@@ -564,6 +599,39 @@ export class VpcPublicPrivateSetup extends Construct {
       };
       return asg;
     });
+
+    // SSM Session Manager access for private-subnet instances, independent of the
+    // gateway. Without these, SSM to a private instance rides the gateway's
+    // internet egress, so a down tunnel also means no way in to fix it. Three
+    // interface endpoints (ssm, ssmmessages, ec2messages) plus private DNS keep
+    // the SSM control path inside the VPC. Only built with the custom gateway.
+    const ssmEndpointSg = gated(cfg.useCustom, () =>
+      new ec2.CfnSecurityGroup(this, 'SsmEndpointSecurityGroup', {
+        groupDescription: 'HTTPS from the VPC to the SSM interface endpoints',
+        vpcId: this.vpc.ref,
+        securityGroupIngress: [{ ipProtocol: 'tcp', fromPort: 443, toPort: 443, cidrIp: '10.0.0.0/16' }],
+        tags: [{ key: 'Name', value: cfg.prefixName('ssm-endpoint-sg') }],
+      }),
+    );
+
+    for (const svc of [
+      { key: 'ssm', id: 'SsmEndpoint' },
+      { key: 'ssmmessages', id: 'SsmMessagesEndpoint' },
+      { key: 'ec2messages', id: 'Ec2MessagesEndpoint' },
+    ]) {
+      const endpoint = gated(cfg.useCustom, () =>
+        new ec2.CfnVPCEndpoint(this, svc.id, {
+          vpcId: this.vpc.ref,
+          serviceName: Fn.sub(`com.amazonaws.\${AWS::Region}.${svc.key}`),
+          vpcEndpointType: 'Interface',
+          privateDnsEnabled: true,
+          // One ENI per private subnet, so each AZ resolves the endpoint locally.
+          subnetIds: this.privateSubnets.map((s) => s.ref),
+          securityGroupIds: [ssmEndpointSg!.ref],
+        }),
+      );
+      if (endpoint) this.ssmEndpoints.push(endpoint);
+    }
   }
 
   private createFlowLogs(cfg: Cfg) {
@@ -620,7 +688,7 @@ export class VpcPublicPrivateSetup extends Construct {
     this.privateSubnets.forEach((subnet, i) => {
       gatedOutput(cfg.hasPrivate, () =>
         new CfnOutput(this, `PrivateSubnet${i + 1}ID`, {
-          description: `Private Subnet ${['A', 'B', 'B'][i]} ID`,
+          description: `Private Subnet ${PRIVATE_SUBNET_SPECS[i].suffix} ID`,
           value: subnet.ref,
           exportName: Fn.sub(`\${AWS::StackName}-privateSubnetID${i + 1}`),
         }),
@@ -629,7 +697,7 @@ export class VpcPublicPrivateSetup extends Construct {
 
     this.publicSubnets.forEach((subnet, i) => {
       new CfnOutput(this, `PublicSubnet${i + 1}ID`, {
-        description: `Public Subnet ${['A', 'B', 'B'][i]} ID`,
+        description: `Public Subnet ${PUBLIC_SUBNET_SPECS[i].suffix} ID`,
         value: subnet.ref,
         exportName: Fn.sub(`\${AWS::StackName}-publicSubnetID${i + 1}`),
       });
@@ -655,6 +723,15 @@ export class VpcPublicPrivateSetup extends Construct {
           'Bucket the gateway reads VPN client files from. Upload your config here, then wire the TODO block in the gateway UserData.',
         value: this.vpnBucket!.ref,
         exportName: Fn.sub('${AWS::StackName}-customGwVpnBucket'),
+      }),
+    );
+
+    gatedOutput(cfg.useCustom, () =>
+      new CfnOutput(this, 'CustomGatewayEip', {
+        description:
+          "The gateway's stable Elastic IP. This is the VPN tunnel's source address; allowlist it on the VPN peer.",
+        value: this.customGwEip!.ref,
+        exportName: Fn.sub('${AWS::StackName}-customGwEip'),
       }),
     );
 

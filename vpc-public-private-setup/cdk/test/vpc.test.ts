@@ -88,6 +88,26 @@ describe('module use with props (PublicOnly prunes private tier)', () => {
   });
 });
 
+describe('custom gateway (PublicPrivateCustomRouting)', () => {
+  const app = new App();
+  const stack = new Stack(app, 'CustomGw');
+  new VpcPublicPrivateSetup(stack, 'Net', { networkMode: 'PublicPrivateCustomRouting' });
+  const template = Template.fromStack(stack);
+  const raw = JSON.stringify(template.toJSON());
+
+  test('allocates a stable Elastic IP for the gateway', () => {
+    template.resourceCountIs('AWS::EC2::EIP', 1);
+  });
+
+  test('boot script is fail-closed and drives OpenVPN', () => {
+    // Guard against silent regression of the kill switch / tunnel wiring in UserData.
+    expect(raw).toContain('iptables -P FORWARD DROP');
+    expect(raw).toContain('openvpn-client@tun-vpn');
+    expect(raw).toContain('rp_filter');
+    expect(raw).toContain('associate-address');
+  });
+});
+
 describe('multiple instances in one stack', () => {
   const app = new App();
   const stack = new Stack(app, 'Multi');
